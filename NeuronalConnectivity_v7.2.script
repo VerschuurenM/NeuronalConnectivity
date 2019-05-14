@@ -1,0 +1,2035 @@
+#require AcapellaAssayLanguage
+//******************************************************************
+// Neuronal Connectivity Analysis
+//-----------------------------------------------------------------------------------
+// Author: Marlies Verschuuren 
+//		marlies.verschuuren@uantwerpen.be
+//		University of Antwerp		
+//		Department of Veterinary Sciences 
+//		Laboratory of Cell Biology and Histology
+// Template: ©2012-2014 Evotec AG, Hamburg. All Rights Reserved.
+// Creation Date: 2015-10-06
+// Last Modified: 2019-05-14
+//*******************************************************************
+//v7.2
+// > Derived from TRIAD_NeuroConnectivity_v7.2 (Marlies Verschuuren, University of Antwerp, marlies.verschuuren@uantwerpen.be)C
+//***********************************************************************
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//START MAIN
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#require AcapellaColumbusWebapp
+#require AcapellaHDF5Support
+
+//*******Include EVOTEC Procedures
+//**UAntwerpen
+path=__file__;
+PathSplit(path | dirname);
+Include(dirname&"EVT_SupportingProcedures_v7.proc")
+Delete(path,dirname);
+
+//*******Start Evaluation
+EVT_StartEvaluation(maxevaluations=0)
+timer::start("EVT_Main_Timer")
+
+//*******Generate sourcedata, welltable and fieltable
+GetSys(EVT_Workflow)
+SetSys(EVT_Workflow=EVT_Workflow)
+EVT_WellProcessing_SingleWell(sourcedata=eval("sourcedata",tbl()),fieldtable=eval("fieldtable",tbl()),welltable=eval("welltable",tbl()),allowdelayedloading=true)
+
+//*******Get Workflow settings
+Selectworkflow(fieldtable=fieldtable, welltable=welltable, sourcedata=sourcedata)
+
+//*******Workflow as string with parameters
+GetSys(EVT_Workflow)
+
+//*******FlatFieldCorrection
+set(IN_FlatfieldCorrection=(at("FlatfieldCorrection",EVT_Workflow)))
+If(IN_FlatfieldCorrection)
+	EVT_ReduceImages_HarmonyFlatfieldCorrection(method="Background", sourcedata=sourcedata | sourcedata=sourcedata)
+End()
+
+//*******Analysis Well
+set(skipWell=(length(eval("WellResults._HIDDEN_WellErrors",""))>0) or (FieldTable.Valid.sum==0))
+if(!skipWell)
+	ConnectivityAnalysis(sourcedata=sourcedata, fieldtable=fieldtable, wellresults=wellresults,IN_FolderResultOutput=IN_FolderResultOutput)
+	timer::stop("EVT_Main_Timer")
+	set(WellResults._RAW_ProcessingDuration=duration)
+	//*******Output
+	EVT_FieldProcessing_CollectOutputs(FieldTable=fieldtable, WellResults=WellResults, IN_FolderResultOutput=IN_FolderResultOutput)	
+End()
+
+//*******End Evaluation
+EVT_EndEvaluation( _EVT_evaluationID)
+
+///-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+//STOP MAIN
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Proc ConnectivityAnalysis(
+	table sourcedata inout,
+	table fieldtable inout,
+	container WellResults inout,
+	string IN_FolderResultOutput in,)
+	{
+		Input("IN_thresholdNuc", 500, "Manual threshold: Nuclei",type="d",description="Intensity threshold to identify nuclei from background. (Lower = larger nuclei)")
+		Input("IN_NucArea", 100, "Lower cutoff area (µm^2): Nuclei", type="d",description= "Minimal area (µm) of the nuclei. (Lower = smaller nuclei/debris identified)")
+		Input("IN_splitFactor", 0.95, "Split factor nuclei: Nuclei",type="d",description="Split factor of nuclei. (Lower = less nuclei split)")
+		Input("IN_NeuronalNucRoundness", 1.05, "Classification -- Cutoff roundness: Nuclei", type="d",description= "Minimal roundness of neuronal nuclei. (Lower = more irregular shaped (more) nuclei identified as neuronal)")
+		Input("IN_NeuronalNucArea", 140, "Classification -- Cutoff area (µm^2) : Nuclei", type="d",description= "Max area (µm) of neuronal nuclei. (Lower = smaller (less) nuclei identified as neuronal)")
+		Input("IN_NucPercMask", 50, "Classification -- Min % of  border within mask neurites : Nuclei", type="d",description="Minimal area % of nuclei within neurite mask. (Lower = more nuclei outside network identified as neuronal)") 
+		Input("IN_ClusterAnalysis",false,"Cluster analysis -- Run: Nuclei",type="y",description="Implement cluster analysis nuclei")
+		Input("In_ClusterDistance",5,"Cluster analysis -- Max distance (µm) : Nuclei", type="d", description="Max distance (µm) between nuclei in cluster. (Lower = smaller search region for neighbouring nuclei)")
+		
+		Input("IN_dilationNuclei",0.75, "Dilation nuclei (µm) to create search region: Neurites",type="d",description="Dilation nuclei (µm) to generate search region")
+		Input("IN_scaleGaussianNeu", 5, "Rough --  Scale gaussian blur: Neurites",type="d",description="Scale of gaussian blur used to preprocess image for thresholding.")
+		Input("IN_thresholdNeu", 1100, "Rough -- Threshold: Neurites",type="d",description="Intensity threshold neurites. (Lower = more neurites detected)")
+		Input("IN_frangiStart",2, "Detail -- Minimal scale for enhancement: Neurites",type="d",description="Minimal scale neurite enhancement (Lower = smaller neurites")
+		Input("IN_frangiStepSize", 5, "Detail -- Step scale for enhancement : Neurites",type="d",description="Step of scales used for neurite enhancement")
+		Input("IN_frangiNumberSteps", 3, "Detail -- Number of scale steps for enhancement: Neurites",type="d",description="Number of different scales used for neurite enhancement")
+		Input("IN_frangiThreshold", 0.1, "Detail -- Threshold after enhancement: Neurites",type="d",description="Threshold after neurite enhancement (Lower = more neurites detected)")
+
+		
+		Input("IN_spotMaxProj",false,"Max projection spot channels: Synapses",type="y",description="Implement max projection of spot channels. (N = Sharpest slice choosen)")
+		input("IN_spotMethod", "SER", "Method for spot detection: Synapses", "s", "Select Method for spot Detection. Allowed values: \"SER\",\"DOG\".")
+		input("IN_SpotAnalysis1",true,"Spot Analysis 1: Synapses",type="y",description=" Spot analysis 1 ")
+		input("IN_SpotAnalysis2",true,"Spot Analysis 2: Synapses",type="y",description="Spot analysis 2 ")
+		Input("IN_autoThresholdSpot",false,"Auto threshold: Synapses",type="y",description="Implement auto threshold for spot detection. (Y = Manual threshold will be ignored)")
+		Input("IN_thresholdSpot1", 0.3, "Manual threshold spot 1: Synapses", type="d",description= "Threshold spot 1 after spot enhancement. (Lower = more & larger spots detected)")
+		Input("IN_thresholdSpot2", 0.3, "Manual threshold spot 2: Synapses", type="d", description="Threshold spot 2 after spot enhancement.(Lower = more & larger spots detected)")
+		Input("IN_scaleSpot1", 1, "Scale spot 1: Synapses", type="d",description= "Scale spot enhancement channel Spot 1. (Lower = smaller spots enhanced)")
+		Input("IN_scaleSpot2", 1, "Scale spot 2: Synapses", type="d",description= "Scale spot enhancement channel Spot 2. (Lower = smaller spots enhanced)")
+				
+		pack(InPara,"IN_*")
+		EVT_Helper_CollectInputs(InPara=InPara, WellResults=WellResults | WellResults )
+		delete(InPara)
+	
+		GetSys(EVT_Workflow)
+		set(WF_Visualization=at("Visualization",EVT_Workflow))
+		set(WF_SaveResultImages=at("SaveImages",EVT_Workflow))
+		set(WF_SaveResults=at("SaveResults",EVT_Workflow))
+		set(WF_Assay="Connectivity")
+		
+		
+		channelNames="";
+		Foreach(0..(WellResults._Hidden_ChannelTable.@count-1), "i")
+			channelNames=channelNames&WellResults._Hidden_ChannelTable.channelName[i];
+		End()
+		
+		foreach(range(0,FieldTable.@rowcount),"_field")
+			if(FieldTable.Valid[_field])
+				//-----Assign images-----//
+				sprintf(filename_base,"r%.2dc%.2df%.2d_",WellResults._RAW_WellRow,WellResults._RAW_WellColumn,FieldTable.Field[_field])
+				dbg::Log(5,"MV","Run",filename_base)
+				//*******MaxProj Nuclei
+				set(FieldResults=eval("FieldTable.FieldResults[_field]",cnt()))
+				TableFilter("Field==" & FieldTable.Field[_field],table=sourcedata | imagetable=table)
+				try()
+					channelNuc=WellResults._HIDDEN_Channel_Nuclei;
+					TableFilter("Channel==" & channelNuc, table=imagetable | imagesNuc=table)
+					Stat::Projection( imagesNuc.sourceimage,Method="max" | imgNuc=result)
+				Catch_Error()
+					dbg::Log(5,"MV","Error","No nuclei channel assigned")
+					Stop()
+				end()
+				//*******MaxProj Neurites
+				try()
+					channelNeu=WellResults._HIDDEN_Channel_Neurites;
+					TableFilter("Channel==" & channelNeu, table=imagetable | imagesNeu=table)
+					Stat::Projection( imagesNeu.sourceimage,Method="max" | imgNeu=result)
+				Catch_Error()
+					dbg::Log(5,"MV","Error","No Neurite channel assigned")
+					Stop()
+				end()
+				
+				//*******Max proj or sharpest z-plane spots
+				if(WF_Assay=="pAMPA")
+					If(IN_spotMaxProjAMPA)
+						try()
+							channelSpot1=WellResults._HIDDEN_Channel_Spot1;
+							TableFilter("Channel==" & channelSpot1, table=imagetable | imagesSpot1=table)
+							Stat::Projection( imagesSpot1.sourceimage,Method="max" | imgSpot1=result)
+						Catch_Error()
+							dbg::Log(5,"MV","Error","No Spot1 channel assigned")
+							Stop()
+						end()
+						try()
+							channelSpot2=WellResults._HIDDEN_Channel_Spot2;
+							TableFilter("Channel==" & channelSpot2, table=imagetable | imagesSpot2=table)
+							Stat::Projection( imagesSpot2.sourceimage,Method="max" | imgSpot2=result)
+						Catch_Error()
+							dbg::Log(5,"MV","Error","No Spot2 channel assigned")
+							Stop()
+						end()
+					Else()
+						try()
+							channelSpot1=WellResults._HIDDEN_Channel_Spot1;
+							TableFilter("Channel==" & channelSpot1, table=imagetable | imagesSpot1=table)
+							stddevMax=0;
+							Foreach(range(0,imagesSpot1.@rowcount),"i")
+								stddev=imagesSpot1.sourceimage[i].@stddev;
+								if(stddev>stddevMax)
+									selPlane=i;
+									stddevMax=stddev;
+								End()	
+							End()
+							imgSpot1=imagesSpot1.sourceimage[selPlane];
+						Catch_Error()
+							dbg::Log(5,"MV","Error","No spot1 channel assigned")
+							Stop()
+						end()
+						try()
+							channelSpot2=WellResults._HIDDEN_Channel_Spot2;
+							TableFilter("Channel==" & channelSpot2, table=imagetable | imagesSpot2=table)
+							imgSpot2=imagesSpot2.sourceimage[selPlane];
+						Catch_Error()
+							dbg::Log(5,"MV","Error","No spot2 channel assigned")
+							Stop()
+						end()
+						
+					End()
+				Else()
+					If(IN_spotMaxProj)
+						if(IN_SpotAnalysis1)
+							try()
+								channelSpot1=WellResults._HIDDEN_Channel_Spot1;
+								TableFilter("Channel==" & channelSpot1, table=imagetable | imagesSpot1=table)
+								Stat::Projection( imagesSpot1.sourceimage,Method="max" | imgSpot1=result)
+							Catch_Error()
+								dbg::Log(5,"MV","Error","No Spot1 channel assigned")
+								Stop()
+							end()
+						End()
+						if(IN_SpotAnalysis2)
+							try()
+								channelSpot2=WellResults._HIDDEN_Channel_Spot2;
+								TableFilter("Channel==" & channelSpot2, table=imagetable | imagesSpot2=table)
+								Stat::Projection( imagesSpot2.sourceimage,Method="max" | imgSpot2=result)
+							Catch_Error()
+								dbg::Log(5,"MV","Error","No Spot2 channel assigned")
+								Stop()
+							end()
+						End()
+					Else()
+						if(IN_SpotAnalysis1)
+							try()
+								channelSpot1=WellResults._HIDDEN_Channel_Spot1;
+								TableFilter("Channel==" & channelSpot1, table=imagetable | imagesSpot1=table)
+								stddevMax=0;
+								Foreach(range(0,imagesSpot1.@rowcount),"i")
+									stddev=imagesSpot1.sourceimage[i].@stddev;
+									if(stddev>stddevMax)
+										selPlane=i;
+										stddevMax=stddev;
+									End()	
+								End()
+								imgSpot1=imagesSpot1.sourceimage[selPlane];
+							Catch_Error()
+								dbg::Log(5,"MV","Error","No spot1 channel assigned")
+								Stop()
+							end()
+						End()
+						if(IN_SpotAnalysis2)
+							try()
+								channelSpot2=WellResults._HIDDEN_Channel_Spot2;
+								TableFilter("Channel==" & channelSpot2, table=imagetable | imagesSpot2=table)
+								imgSpot2=imagesSpot2.sourceimage[selPlane];
+							Catch_Error()
+								dbg::Log(5,"MV","Error","No spot2 channel assigned")
+								Stop()
+							end()
+						End()
+					End()
+				End()
+				
+				if(at("X1",channelNames))
+					//*******MaxProj 
+					try()
+						channelX=WellResults._HIDDEN_Channel_X1;
+						TableFilter("Channel==" & channelX, table=imagetable | table)
+						Stat::Projection( table.sourceimage,Method="max" | imgX1=result)
+					Catch_Error()
+						dbg::Log(5,"MV","Error","No X1 channel assigned")
+						Stop()
+					end()
+				End()
+				if(at("X2",channelNames))
+					//*******MaxProj 
+					try()
+						channelX=WellResults._HIDDEN_Channel_X2;
+						TableFilter("Channel==" & channelX, table=imagetable | table)
+						Stat::Projection( table.sourceimage,Method="max" | imgX2=result)
+					Catch_Error()
+						dbg::Log(5,"MV","Error","No X2 channel assigned")
+						Stop()
+					end()
+				End()
+				if(at("X3",channelNames))
+					//*******MaxProj 
+					try()
+						channelX=WellResults._HIDDEN_Channel_X3;
+						TableFilter("Channel==" & channelX, table=imagetable | table)
+						Stat::Projection( table.sourceimage,Method="max" | imgX3=result)
+					Catch_Error()
+						dbg::Log(5,"MV","Error","No X3 channel assigned")
+						Stop()
+					end()
+				End()
+				if(at("X4",channelNames))
+					//*******MaxProj 
+					try()
+						channelX=WellResults._HIDDEN_Channel_X4;
+						TableFilter("Channel==" & channelX, table=imagetable | table)
+						Stat::Projection( table.sourceimage,Method="max" | imgX4=result)
+					Catch_Error()
+						dbg::Log(5,"MV","Error","No X4 channel assigned")
+						Stop()
+					end()
+				End()
+				
+				delete(imagesNuc,imagesNeu, imagesSpot1, imagesSpot2,imagetable,channelNeu,channelNuc,channelSpot1, channelSpot2,selPlane,stddevMax,stddev,i);
+
+				//-----Calibration-----//
+				AreaSizeCalibration=sourcedata.ImageResolutionX@um.mean*sourcedata.ImageResolutionY@um.mean;
+				DistanceSizeCalibration=sqrt(AreaSizeCalibration);
+				
+				//-----Texture channel images -----//
+				Mask(threshold=1, image=sourcedata.sourceimage[0] | mask=mask)
+				Mask2Stencil(Mask=mask, Method="Joint clusters" | stencil)
+				Stencil2Objects(Stencil=stencil | wholeImage=objects)
+				
+				Texture::CalcHaralickFeatures(image=imgNuc, objects=wholeImage, stencilname="body", distance=1| textureImgNuc=objects,featurenames,NormalizedImage)
+				CalcIntensity(Stencil=body,Image=imgNuc,attributeName="int",CalcStdDev=true,Objects=textureImgNuc | textureImgNuc=objects)
+				Texture::CalcHaralickFeatures(image=imgNeu, objects=wholeImage, stencilname="body", distance=1| textureImgNeu=objects,featurenames,NormalizedImage)
+				CalcIntensity(Stencil=body,Image=imgNeu,attributeName="int",CalcStdDev=true,Objects=textureImgNeu | textureImgNeu=objects)
+				If(IN_SpotAnalysis1)
+					Texture::CalcHaralickFeatures(image=imgSpot1, objects=wholeImage, stencilname="body", distance=1| textureImgSpot1=objects,featurenames,NormalizedImage)
+					CalcIntensity(Stencil=body,Image=imgSpot1,attributeName="int",CalcStdDev=true,Objects=textureImgSpot1 | textureImgSpot1=objects)
+				End()
+				if(IN_SpotAnalysis2)
+					Texture::CalcHaralickFeatures(image=imgSpot2, objects=wholeImage, stencilname="body", distance=1| textureImgSpot2=objects,featurenames,NormalizedImage)
+					CalcIntensity(Stencil=body,Image=imgSpot2,attributeName="int",CalcStdDev=true,Objects=textureImgSpot2 | textureImgSpot2=objects)
+				End()
+				if(WF_Assay=="pAMPA")
+					Texture::CalcHaralickFeatures(image=imgSpot2, objects=wholeImage, stencilname="body", distance=1| textureImgSpot2=objects,featurenames,NormalizedImage)
+					CalcIntensity(Stencil=body,Image=imgSpot2,attributeName="int",CalcStdDev=true,Objects=textureImgSpot2 | textureImgSpot2=objects)
+				End()
+				
+				Delete(featureNames,NormalizedImage,stencil,mask,wholeImage)
+				
+				//-----Nuclear Analysis -- Detection -----//
+				sizeKernel=2/sqrt(areaSizeCalibration);
+				minAreaPx=IN_NucArea/areaSizeCalibration;
+				detectNuclei(imgNuc=imgNuc,threshold=IN_thresholdNuc, sizeKernel=sizeKernel, minAreaPx=minAreaPx, splitFactor=IN_splitFactor | nuclei=nuclei)
+				
+				//-----Neurite Analysis -- Detection -----//
+				detectNeuriteMask(imgNeu=imgNeu, scaleGaussian = IN_scaleGaussianNeu, threshold=IN_thresholdNeu, frangiStart=IN_frangiStart, frangiStepSize=IN_frangiStepSize, frangiNumberSteps=IN_frangiNumberSteps, thresholdFrangi=IN_FrangiThreshold | maskNeu = maskNeu, imgFrangi=imgFrangi, imgNeu_Result_Mask=imgNeu_Result_Mask)
+				
+				//-----Nuclear Analysis -- Classification -----//
+				if(Nuclei.@count==0)
+						WellResults._RAW_IndexInvalidFields=WellResults._RAW_IndexInvalidFields & (_field+1) & "-";
+						FieldTable.Valid[_field]=0;
+				else()
+										//-----Nuclear Analysis -- Morphology & texture -----//
+					setupContainer=cnt(CenterMode="Original",bArea=1,bOrigAxial=1,bOrigInten=1);
+					Morphology::CalcTextuMorphoFeatures(image=imgNuc, objects=nuclei, regionname= "body", RequestContainer=setupContainer| nuclei=objects)
+					Texture::CalcSERFeatures(image=imgNuc, objects=nuclei, stencilname="body", scale=1| nuclei=objects,SERillustrations,SERnames)
+					CalcArea(Stencil=border, objects=nuclei| nuclei=objects)		
+					
+					//-----Nuclear Analysis -- Intensity in other channels -----//
+					CalcIntensity(Image=imgNeu, attributeName="intensityNeu", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					if(WF_Assay=="pAMPA")		
+						CalcIntensity(Image=imgSpot1, attributeName="intensitySpot1", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+						CalcIntensity(Image=imgSpot2, attributeName="intensitySpot2", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					End()	
+					if(IN_SpotAnalysis1)			
+						CalcIntensity(Image=imgSpot1, attributeName="intensitySpot1", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					End()	
+					if(IN_SpotAnalysis2)			
+						CalcIntensity(Image=imgSpot2, attributeName="intensitySpot2", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					End()
+					
+					If(at("X1",channelNames))
+						CalcIntensity(Image=imgX1, attributeName="intensityX1", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					End()
+					If(at("X2",channelNames))
+						CalcIntensity(Image=imgX2, attributeName="intensityX2", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					End()
+					If(at("X3",channelNames))
+						CalcIntensity(Image=imgX3, attributeName="intensityX3", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					End()
+					If(at("X4",channelNames))
+						CalcIntensity(Image=imgX4, attributeName="intensityX4", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+					End()											
+								
+					//-----Filter neuronal nuclei-----//
+					//*******Calculate Border
+					CalcMassCentre(Objects=nuclei, Stencil=body | nuclei = objects )
+					CalcZone(Objects=nuclei, ZoneType= "equidistant" | nuclei = objects )
+					ZoneMask(filt_high=0, filt_low=5, objects=nuclei | nuclei = objects )
+					renameattr(OuterRegion=zonemask, Objects=nuclei  | nuclei = objects )
+					CalcIntensity(Objects=nuclei, stencil=OuterRegion, image=maskNeu |nuclei = objects )
+					Delete(nuclei.outerzone,nuclei.zone)
+					nuclei_Neuronal=nuclei;
+						
+					//*******Roundness
+					ObjectList::Split (Expression="Compactness>"&IN_NeuronalNucRoundness, Objects=nuclei_Neuronal | nuclei_Neuronal = objects, restCompactness=other)
+					//*******Area
+					threshAreaPx=IN_NeuronalNucArea/areaSizeCalibration;
+					ObjectList::Split (Expression="area<"&threshAreaPx,Objects=nuclei_Neuronal | nuclei_Neuronal = objects, restArea=other)	
+					//****** Border Nuclei in neurite mask
+					ObjectList::Split(Expression="OuterRegion_Intensity>"&(IN_NucPercMask/100), Objects=nuclei_Neuronal | nuclei_Neuronal = objects, restMask=other )					
+					
+					//*******Merge Non-Neuronal
+					AddObjects(Extra=restCompactness, Objects=restArea| nuclei_NonNeuronal = objects)
+					AddObjects(Extra=restMask, Objects=nuclei_NonNeuronal | nuclei_NonNeuronal = objects)
+					
+					//****Image Illustrations
+					CarryObjects(Stencil=restArea.body, Data="red", image=imgNuc  | imgNuc_Result = image)
+					CarryObjects(Stencil=restCompactness.body, Data="yellow", image=imgNuc_Result  | imgNuc_Result = image)
+					CarryObjects(Stencil=nuclei_Neuronal.body, Data="green", image=imgNuc_Result  | imgNuc_Result = image)
+					CarryObjects(Stencil=restMask.body, Data="Magenta", image=imgNuc_Result  | imgNuc_Result = image)
+					TextOnImage(x=(nuclei.MassCentreX), y=(nuclei.MassCentreY-30), text=("R: "&nuclei.Compactness), image=imgNuc_Result | imgNuc_Result = image )
+					TextOnImage(x=(nuclei.MassCentreX), y=(nuclei.MassCentreY), text=("A: "&(nuclei.Area*areaSizeCalibration)), image=imgNuc_Result | imgNuc_Result = image )
+					TextOnImage(x=(nuclei.MassCentreX), y=(nuclei.MassCentreY+30), text=("%: "&(nuclei.outerRegion_Intensity*100)), image=imgNuc_Result | imgNuc_Result = image )					
+					Delete(restCompactness,restArea,restMask,restEdge)
+				
+				//-----Network Analysis --Detection ----//
+				detectNeurites(maskNeu=maskNeu, nuclei=nuclei_neuronal  | neurites=neurites)
+				CalcIntensity(Stencil=body,Image=imgNeu,attributeName="intensityNeu",CalcStdDev=true,Objects=neurites | neurites=objects)
+				CalcIntensity(image=neurites.body.@array, attributeName="IntensityMask", Stencil=body, CalcStdDev=true, Objects=nuclei | nuclei=objects)
+				CalcIntensity(image=neurites.body.@array, attributeName="IntensityMask", Stencil=body, CalcStdDev=true, Objects=nuclei_Neuronal | nuclei_Neuronal=objects)
+				CalcIntensity(image=neurites.body.@array, attributeName="IntensityMask", Stencil=body, CalcStdDev=true, Objects=nuclei_NonNeuronal | nuclei_NonNeuronal=objects)
+
+				
+				//-----Nuclear Analysis -- Clustering ----//
+					if(IN_ClusterAnalysis)
+						//-----Distance Image-----//
+						MaskToDistanceImage(ObjectMask=nuclei_NonNeuronal.body, MaxDistance=100 | EDM = distanceimage)
+						
+						//-----Cluster Analysis-----//
+						if(nuclei.@count>0)
+							ClusterAnalysis(Objects=nuclei, IN_max_dist=(IN_ClusterDistance/distanceSizeCalibration) | nuclei = objects, clustersNuclei = clusters)
+							NearestNeighbourDistance(StencilName=body,objects=nuclei,MaximumDistance=(imgNuc.@width/5)| nuclei = objects)
+							if(nuclei_Neuronal.@count>0)
+								ClusterAnalysis(Objects=nuclei_Neuronal, IN_max_dist=(IN_ClusterDistance/distanceSizeCalibration)  | nuclei_Neuronal = objects, clustersNuclei_Neuronal = clusters)
+								NearestNeighbourDistance(StencilName=body,objects=nuclei_Neuronal,MaximumDistance=(imgNuc.@width/3)| nuclei_Neuronal = objects)
+							Else()
+								clustersNuclei_Neuronal = nuclei_neuronal;		
+								nuclei_neuronal.NeighbourDistance=vec();
+								nuclei_neuronal.NumberOfObjectsInCLuster=vec();			
+							End()
+							if(nuclei_NonNeuronal.@count>0)
+								ClusterAnalysis(Objects=nuclei_NonNeuronal, IN_max_dist=(IN_ClusterDistance/distanceSizeCalibration)  | nuclei_NonNeuronal = objects, clustersNuclei_NonNeuronal = clusters)
+								NearestNeighbourDistance(StencilName=body,objects=nuclei_NonNeuronal,MaximumDistance=(imgNuc.@width/5)| nuclei_NonNeuronal = objects)
+							Else()
+								clustersNuclei_NonNeuronal = nuclei_Nonneuronal;		
+								nuclei_NonNeuronal.NeighbourDistance=vec();
+								nuclei_Nonneuronal.NumberOfObjectsInCLuster=vec();		
+							End()
+						Else()
+							clustersNuclei = nuclei_neuronal;		
+							nuclei.NeighbourDistance=vec();
+							nuclei.NumberOfObjectsInCLuster=vec();	
+						End()
+					End()
+										
+					//------- Skeleton Neurites with exclusion nuclei
+					if(neurites.body.@array.@mean>0)
+							Skeleton(imgNeu=imgNeu, neurites=neurites, nuclei= nuclei_neuronal,  dilationPx = IN_dilationNuclei*(-1)/distanceSizeCalibration, minAreaPx=5/DistanceSizeCalibration | skeleton=skeleton)
+					Else()
+						skeleton=neurites;
+						skeleton.skeleton=neurites.body;
+						skeleton.dendrite_maxwidth=vec(0);
+						skeleton.dendrite_meanwidth=vec(0);
+						skeleton.dendrite_medianwidth=vec(0);
+						skeleton.dendrite_minwidth=vec(0);
+						skeleton.skeleton_node_count=vec(0);
+					End()
+					
+					//-----Search Region: dilate + exclude neuronal nuclei and artefacts in staining pre/post----- + Intesntity measurements//
+					if(!IN_SpotAnalysis1)
+						searchRegion(neurites=neurites, nuclei=nuclei_neuronal, dilationPx = IN_dilationNuclei*(-1)/distanceSizeCalibration, minAreaPx = 5/areaSizeCalibration | neurites = neurites)
+						CalcIntensity(Stencil=searchRegion, Image=imgNeu, AttributeName="intensityNeu",Objects=neurites | neurites=objects)
+					Else()
+						if(!IN_SpotAnalysis2)
+							searchRegion1Spot(neurites=neurites, nuclei=nuclei_neuronal, img1=imgSpot1, dilationPx = IN_dilationNuclei*(-1)/distanceSizeCalibration, minAreaPx = 5/areaSizeCalibration | neurites = neurites)
+							CalcIntensity(Stencil=searchRegion, Image=imgSpot1, AttributeName="intensitySpot1",Objects=neurites | neurites=objects)
+							CalcIntensity(Stencil=searchRegion, Image=imgNeu, AttributeName="intensityNeu",Objects=neurites | neurites=objects)
+							If(WF_Assay=="pAMPA")
+								CalcIntensity(Stencil=searchRegion, Image=imgSpot2, AttributeName="intensitySpot2",Objects=neurites | neurites=objects)
+							End()
+						Else()
+							searchRegion2Spot(neurites=neurites, nuclei=nuclei_neuronal, img1=imgSpot1, img2=imgSpot2, dilationPx =IN_dilationNuclei*(-1)/distanceSizeCalibration, minAreaPx = 5/areaSizeCalibration | neurites = neurites)
+						End()
+					End()
+					If(at("X1",channelNames))
+						CalcIntensity(Image=imgX1, attributeName="intensityX1", Stencil=searchRegion, CalcStdDev=true, Objects=neurites | neurites=objects)
+					End()
+					If(at("X2",channelNames))
+						CalcIntensity(Image=imgX2, attributeName="intensityX2", Stencil=searchRegion, CalcStdDev=true, Objects=neurites | neurites=objects)
+					End()
+					If(at("X3",channelNames))
+						CalcIntensity(Image=imgX3, attributeName="intensityX3", Stencil=searchRegion, CalcStdDev=true, Objects=neurites | neurites=objects)
+					End()
+					If(at("X4",channelNames))
+						CalcIntensity(Image=imgX4, attributeName="intensityX4", Stencil=searchRegion, CalcStdDev=true, Objects=neurites | neurites=objects)
+					End()
+
+						
+					//-----Spot Detection & parameter extraction-----//
+						//*******SpotDetection & Intensity measurements
+						If(IN_SpotAnalysis1)
+							SpotDetection(img=imgSpot1, method=IN_spotMethod, spotDistance=0.30/distanceSizeCalibration, iterations=0.75/distanceSizeCalibration, scale=IN_scaleSpot1, autoThreshold=IN_autoThresholdSpot, threshold=IN_thresholdSpot1, searchRegion=neurites.searchRegion.@array| spot1 = objects)
+							CalcIntensity(Stencil=body, image=imgSpot1, objects=spot1, AttributeName="Intensity" | spot1 = objects)
+							
+							NOT(image=spot1.body.@mask.@array | image)
+							AND(mask=neurites.searchRegion, image=image | image)
+							Stencil::CreateFromArray(Array=image, ObjectCount=1 | stencil )
+							stencil2objects(Stencil | temp=objects)
+							CalcIntensity(Stencil=body, Image=imgSpot1, AttributeName="intensityBg",Objects=temp | temp=objects)
+							set(neurites.intensityBgSpot1=temp.intensityBg)
+							
+							CalcIntensity(Stencil=searchRegion, Image=imgSpot1, AttributeName="intensitySpot1",Objects=neurites | neurites=objects)
+							CalcIntensity(Stencil=searchRegion, Image=imgNeu, AttributeName="intensityNeu",Objects=neurites | neurites=objects)
+							CalcArea(Stencil=body, objects=spot1| spot1 = objects)
+						End()
+						If(IN_SpotAnalysis2)
+							SpotDetection(img=imgSpot2, method=IN_spotMethod, spotDistance=0.30/distanceSizeCalibration, iterations=0.75/distanceSizeCalibration, scale=IN_scaleSpot2, autoThreshold=IN_autoThresholdSpot, threshold=IN_thresholdSpot2, searchRegion=neurites.searchRegion.@array| spot2 = objects)
+							CalcIntensity(Stencil=body, image=imgSpot2, objects=spot2, AttributeName="Intensity" | spot2 = objects)
+							
+							NOT(image=spot2.body.@mask.@array | image)
+							AND(mask=neurites.searchRegion, image=image | image)
+							Stencil::CreateFromArray(Array=image, ObjectCount=1 | stencil )
+							stencil2objects(Stencil | temp=objects)
+							CalcIntensity(Stencil=body, Image=imgSpot2, AttributeName="intensityBg",Objects=temp | temp=objects)
+							set(neurites.intensityBgSpot2=temp.intensityBg)
+							
+							CalcIntensity(Stencil=searchRegion, Image=imgSpot2, AttributeName="intensitySpot2",Objects=neurites | neurites=objects)
+							CalcArea(Stencil=body, objects=spot2| spot2 = objects)					
+						End()
+
+						//*******Object-based colocalisation: Measure overlap through intensity measure in binary mask (.body.@mask.@array)
+						If(IN_SpotAnalysis2)
+							//*******Overlap entire field
+							Mul(x=Spot1.body.@mask.@array, y=spot2.body.@mask.@array, result_type="y_type" | result)
+							similarityIndex=(2*result.@sum)/(Spot1.body.@mask.@array.@sum + spot2.body.@mask.@array.@sum);
+							//*******Overlap for every spot
+							CalcIntensity(Stencil=body, image=spot2.body.@mask.@array,objects=Spot1,AttributeName="Overlap" | Spot1 = objects)
+							CalcIntensity(Stencil=body, image=Spot1.body.@mask.@array,objects=spot2,AttributeName="Overlap" | spot2 = objects)
+							
+							//*******Count overlapping spots = synapses
+							ObjectFilter("overlap>"&0, objects=spot1 | Synapse1 = objects)
+							ObjectFilter("overlap>"&0, objects=spot2 | Synapse2 = objects)
+							Or(mask=synapse1.body.@mask.@array, image=synapse2.body.@mask.@array | image)
+							Mask(threshold=1, image=image | mask)
+							Mask2Stencil(Mask=mask, Method="Joint clusters" | stencil)
+							Stencil2Objects(Stencil=stencil | synapses=objects)
+							CalcIntensity(Stencil=body, image=imgSpot1,objects=Synapses,AttributeName="IntensityImgSpot1" | Synapses = objects)
+							CalcIntensity(Stencil=body, image=imgSpot2,objects=Synapses,AttributeName="IntensityImgSpot2" | Synapses = objects)
+							CalcAttr(Attrname="intRatio", Formula=intensityImgSpot1/intensityImgSpot2, Objects=Synapses | Synapses = objects)
+							
+							//*******Calculate percentage spots for which overlap > threshold overlap
+							spot1PercWithOverlap=Synapse1.@count/Spot1.@count*100;
+							spot2PercWithOverlap=Synapse2.@count/spot2.@count*100;
+							Delete(Synapse1,Synapse2,image,mask,stencil)
+							
+							//*******Intensity-based colocalisation
+							pearsonCorr(ch1 = imgSpot1, ch2 = imgSpot2, restrictiveStencil = neurites.searchRegion | pearsonCorr, pearsonMap)
+						End()
+					
+					//-----Save  Images-----//
+					if(WF_Visualization)
+						ImageView(image=imgNuc, item=imgNuc, label="imgNuc")
+						ImageView(image=imgNeu, item=imgNeu, label="imgNeu")
+						ImageView(image=imgFrangi, item=imgFrangi, label="imgFrangi")
+						CarryObjects(Stencil=nuclei.outerRegion, Data="Blue", image=imgNeu_Result_Mask  | imgNeu_Result_Mask = image)
+						ImageView(image=imgNeu_Result_Mask, item=imgNeu_Result_Mask, label="imgNeu_Mask", title="ImgNeu_Mask: Red=Threshold, Yellow=Frangi, Blue=Nuclear Border")
+						ImageView(image=imgNuc_Result, item=imgNuc_Result, label="imgNuc_Result", title="ImgNuc_Result: Red=CutOff Area, Yellow=CutOff Roundness, Magenta=CutoOff Mask, Green=Neuronal")
+						ImageView(image=imgNeu, item=neurites.border, label="imgNeu_Neurites")
+						If(IN_clusteranalysis)
+							ImageView(image=imgNuc, item=clustersNuclei.border, label="imgNuc_Cluster")
+							ImageView(image=imgNuc, item=clustersNuclei_Neuronal.border, label="imgNuc_nuclei_neuronal_cluster")
+							ImageView(image=imgNuc, item=clustersNuclei_NonNeuronal.border, label="imgNuc_nuclei_nonneuronal_cluster")
+						End()
+						ImageView(image=imgNeu, item=skeleton.skeleton, label="imgNeu_Skeleton")
+						If(IN_SpotAnalysis1)
+							ImageView(image=imgNeu, item=neurites.searchRegion, label="imgNeu_SearchRegion")
+							ImageView(image=imgSpot1, item=imgSpot1, label="imgSpot1")
+							ImageView(image=imgSpot1, item=spot1.body, label="imgSpot1_Spot1")
+						End()
+						if(IN_SpotAnalysis2)
+							ImageView(image=imgSpot2, item=imgSpot2, label="imgSpot2")
+							ImageView(image=imgSpot2, item=spot2.body, label= "imgSpot2_Spot2")
+						End()
+					End()
+					
+					Folder1="/" & Columbus::ValidFilenamePart(WellResults._RAW_PlateName).filename;
+					Folder2="/" & Columbus::ValidFilenamePart(WellResults._RAW_MeasurementDate).filename;
+					Folder3="/resultImages";
+					if(WF_SaveResultImages)
+					image_blank=sourcedata.sourceimage[0]*0;
+						if(length(IN_FolderResultOutput)>0)
+							set(filename="")
+							try()
+								if(FileInfo(IN_FolderResultOutput).FileInfo.exists)
+									if(!FileInfo(IN_FolderResultOutput & Folder1).FileInfo.exists)
+										MKDir(IN_FolderResultOutput & Folder1)
+									end()
+									if(!FileInfo(IN_FolderResultOutput & Folder1 & Folder2).FileInfo.exists)
+										MKDir(IN_FolderResultOutput & Folder1 & Folder2)
+									end()
+									if(!FileInfo(IN_FolderResultOutput & Folder3).FileInfo.exists)
+										MKDir(IN_FolderResultOutput & Folder1 & Folder2 & Folder3)
+									end()
+									sprintf(filename_base,"r%.2dc%.2df%.2d_",WellResults._RAW_WellRow,WellResults._RAW_WellColumn,FieldTable.Field[_field])
+									
+									set(filename=filename_base & "A_Nuc")
+									set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+									set(filename=iif(at(".png",filename),filename,filename & ".png"))
+									set(visualimage=imgNuc)
+									writeimage(fileName,imageformat="png",image=visualimage)
+									Delete(visualImage)
+										
+									set(filename=filename_base & "A_Nuc_All")
+									set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+									set(filename=iif(at(".png",filename),filename,filename & ".png"))
+									set(visualimage=iif(nuclei.@count,nuclei.body.@mask.@array,image_blank))
+									writeimage(fileName,imageformat="png",image=visualimage)
+									Delete(visualImage)
+									
+									if(IN_ClusterAnalysis)
+										set(filename=filename_base & "A_Nuc_Clusters")
+										set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+										set(filename=iif(at(".png",filename),filename,filename & ".png"))
+										set(visualimage=iif(clustersNuclei.@count,clustersNuclei.body.@mask.@array,image_blank))
+										writeimage(fileName,imageformat="png",image=visualimage)
+										Delete(visualImage)
+									End()
+											
+									set(filename=filename_base & "A_Nuc_Neuronal")
+									set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+									set(filename=iif(at(".png",filename),filename,filename & ".png"))
+									set(visualimage=iif(nuclei_neuronal.@count,nuclei_neuronal.body.@mask.@array,image_blank))
+									writeimage(fileName,imageformat="png",image=visualimage)
+									Delete(visualImage)
+								
+									set(filename=filename_base & "B_Neu")
+									set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+									set(filename=iif(at(".png",filename),filename,filename & ".png"))
+									set(visualimage=iif(neurites.@count,imgNeu,image_blank))
+									writeimage(fileName,imageformat="png",image=visualimage)
+									Delete(visualImage)
+							
+									set(filename=filename_base & "B_Neu_Detected")
+									set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+									set(filename=iif(at(".png",filename),filename,filename & ".png"))
+									set(visualimage=iif(neurites.@count,neurites.body.@array,image_blank))
+									writeimage(fileName,imageformat="png",image=visualimage)
+									Delete(visualImage)
+
+									set(filename=filename_base & "B_Neu_Skeleton")
+									set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+									set(filename=iif(at(".png",filename),filename,filename & ".png"))
+									set(visualimage=iif(neurites.@count,skeleton.skeleton.@array,image_blank))
+									writeimage(fileName,imageformat="png",image=visualimage)
+									Delete(visualImage)
+									
+									If(IN_SpotAnalysis1)
+										set(filename=filename_base & "B_Neu_Search")
+										set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+										set(filename=iif(at(".png",filename),filename,filename & ".png"))
+										set(visualimage=iif(neurites.@count,neurites.searchRegion.@array,image_blank))
+										writeimage(fileName,imageformat="png", image=visualimage)
+										Delete(visualImage)
+												
+										set(image_blank=imgSpot1*0.0)
+										sprintf(filename_base,"r%.2dc%.2df%.2d_",WellResults._RAW_WellRow,WellResults._RAW_WellColumn,FieldTable.Field[_field])
+										set(filename=filename_base & "C_Spot1")
+										set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+										set(filename=iif(at(".png",filename),filename,filename & ".png"))
+										set(visualimage=iif(Spot1.@count,imgSpot1,image_blank))
+										writeimage(fileName,imageformat="png",image=visualimage)
+										Delete(visualImage)
+									
+										set(filename=filename_base & "C_Spot1_Det")
+										set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+										set(filename=iif(at(".png",filename),filename,filename & ".png"))
+										set(visualimage=iif(Spot1.@count,Spot1.body.@mask.@array,image_blank))
+										writeimage(fileName,imageformat="png",image=visualimage)
+										Delete(visualImage)
+									End()
+									If(IN_SpotAnalysis2)
+										set(filename=filename_base & "D_Spot2")
+										set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+										set(filename=iif(at(".png",filename),filename,filename & ".png"))
+										set(visualimage=iif(spot2.@count,imgSpot2,image_blank))
+										writeimage(fileName,imageformat="png",image=visualimage)
+										Delete(visualImage)
+									
+										set(filename=filename_base & "D_Spot2_Det")
+										set(filename=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(filename).filename)
+										set(filename=iif(at(".png",filename),filename,filename & ".png"))
+										set(visualimage=iif(spot2.@count,spot2.body.@mask.@array,image_blank))
+										writeimage(fileName,imageformat="png",image=visualimage)
+										Delete(visualImage)
+									End()
+								end()
+							Catch_Error()
+								dbg::Log(5,"EVT","FieldProcessing","Collect Outputs - Error in writing " & filename)
+							end()	
+						end()
+					end()				
+					
+					//-----Store FieldData-----//
+					if(WF_SaveResults)
+						FieldTable.FieldResults[_Field]=eval("FieldTable.FieldResults[_field]",cnt());
+						
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNuclei_Intensity=textureImgNuc.int.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNuclei_IntensityStddev=textureImgNuc.int_stddev.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNuclei_Contrast=textureImgNuc.HaralickContrast.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNuclei_Correlation=textureImgNuc.HaralickCorrelation.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNuclei_Homogeneity=textureImgNuc.HaralickHomogeneity.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNuclei_SumVariance=textureImgNuc.HaralickSumVariance.@mean;
+						
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNeurite_Intensity=textureImgNeu.int.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNeurite_IntensityStddev=textureImgNeu.int_stddev.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNeurite_Contrast=textureImgNeu.HaralickContrast.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNeurite_Correlation=textureImgNeu.HaralickCorrelation.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNeurite_Homogeneity=textureImgNeu.HaralickHomogeneity.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_ChannelNeurite_SumVariance=textureImgNeu.HaralickSumVariance.@mean;
+						
+						If(IN_SpotAnalysis1)
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot1_Intensity=textureImgSpot1.int.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot1_IntensityStddev=textureImgSpot1.int_stddev.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot1_Contrast=textureImgSpot1.HaralickContrast.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot1_Correlation=textureImgSpot1.HaralickCorrelation.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot1_Homogeneity=textureImgSpot1.HaralickHomogeneity.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot1_SumVariance=textureImgSpot1.HaralickSumVariance.@mean;
+						End()
+						
+						If(IN_SpotAnalysis2)
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot2_Intensity=textureImgSpot2.int.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot2_IntensityStddev=textureImgSpot2.int_stddev.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot2_Contrast=textureImgSpot2.HaralickContrast.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot2_Correlation=textureImgSpot2.HaralickCorrelation.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot2_Homogeneity=textureImgSpot2.HaralickHomogeneity.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_ChannelSpot2_SumVariance=textureImgSpot2.HaralickSumVariance.@mean;
+						End()
+					
+						
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_Area=neurites.area.@mean*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_AreaSearch=neurites.searchRegion.Area.@mean*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_Int=neurites.intensityNeu.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_Int_sd=neurites.intensityNeu_stddev.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_Length=skeleton.area.@mean*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_Width_Mean=skeleton.dendrite_meanwidth.@mean*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_Width_Max=skeleton.dendrite_maxwidth.@mean*distanceSizeCalibration;	
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_Nodes=skeleton.skeleton_node_count.@mean;
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_AreaPerNucleus=neurites.area.@mean*areaSizeCalibration/nuclei_neuronal.@count;	
+						FieldTable.FieldResults[_Field]._MEAN_Neurite_LengthPerNucleus=skeleton.area.@mean*distanceSizeCalibration/nuclei_neuronal.@count;	
+						
+						if(at("X1",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Neurite_IntX1=Neurites.IntensityX1.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Neurite_IntX1=Neurites.IntensityX1.@stddev;
+						End()
+						If(at("X2",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Neurite_IntX2=Neurites.IntensityX2.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Neurite_IntX2=Neurites.IntensityX2.@stddev;
+						End()
+						If(at("X3",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Neurite_IntX3=Neurites.IntensityX3.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Neurite_IntX3=Neurites.IntensityX3.@stddev;			
+						End()
+						If(at("X4",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Neurite_IntX4=Neurites.IntensityX4.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Neurite_IntX4=Neurites.IntensityX4.@stddev;		
+						End()	
+						
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Count=nuclei.@count;
+						if(IN_ClusterAnalysis)
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_MinDistance=nuclei.NeighbourDistance.@mean*distanceSizeCalibration;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_MinDistance=nuclei.NeighbourDistance.@stddev*distanceSizeCalibration;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NumberInCluster=nuclei.NumberOfObjectsInCluster.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NumberInCluster=nuclei.NumberOfObjectsInCluster.@stddev;
+						End()
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Area=nuclei.area.@mean*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Area=nuclei.area.@stddev*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Perimeter=nuclei.border_area.@mean*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Perimeter=nuclei.border_area.@stddev*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Roundness=nuclei.Compactness.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Roundness=nuclei.Compactness.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Int=nuclei.IntenMean.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Int=nuclei.IntenMean.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Int_relDev=nuclei.IntenRelDev.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Int_relDev=nuclei.IntenRelDev.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_IntNeu=nuclei.IntensityNeu.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_IntNeu=nuclei.IntensityNeu.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_SERSpot=nuclei.SERSpot.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_SERSpot=nuclei.SERSpot.@stddev;
+						
+						
+							if(IN_SpotAnalysis1)
+								FieldTable.FieldResults[_Field]._MEAN_Nuclei_IntSpot1=nuclei.IntensitySpot1.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Nuclei_IntSpot1=nuclei.IntensitySpot1.@stddev;
+							End()
+							if(IN_SpotAnalysis2)
+								FieldTable.FieldResults[_Field]._MEAN_Nuclei_IntSpot2=nuclei.IntensitySpot2.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Nuclei_IntSpot2=nuclei.IntensitySpot2.@stddev;
+							End()
+						
+						If(at("X1",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_IntX1=nuclei.IntensityX1.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_IntX1=nuclei.IntensityX1.@stddev;
+						End()
+						If(at("X2",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_IntX2=nuclei.IntensityX2.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_IntX2=nuclei.IntensityX2.@stddev;
+						End()
+						If(at("X3",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_IntX3=nuclei.IntensityX3.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_IntX3=nuclei.IntensityX3.@stddev;				
+						End()
+						If(at("X4",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_IntX4=nuclei.IntensityX4.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_IntX4=nuclei.IntensityX4.@stddev;				
+						End()				
+							
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_Count=nuclei_neuronal.@count;
+						if(IN_ClusterAnalysis)
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_MinDistance=nuclei_neuronal.NeighbourDistance.@mean*distanceSizeCalibration;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_MinDistance=nuclei_neuronal.NeighbourDistance.@stddev*distanceSizeCalibration;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_NumberInCluster=nuclei_neuronal.NumberOfObjectsInCluster.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_NumberInCluster=nuclei_neuronal.NumberOfObjectsInCluster.@stddev;
+						End()
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_Ratio=nuclei_neuronal.@count/nuclei.@count;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_Area=nuclei_neuronal.area.@mean*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_Area=nuclei_neuronal.area.@stddev*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_Perimeter=nuclei_neuronal.border_area.@mean*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_Perimeter=nuclei_neuronal.border_area.@stddev*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_Roundness=nuclei_neuronal.Compactness.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_Roundness=nuclei_neuronal.Compactness.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_Int=nuclei_neuronal.IntenMean.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_Int=nuclei_neuronal.IntenMean.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_Int_relDev=nuclei_neuronal.IntenRelDev.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_Int_relDev=nuclei_neuronal.IntenRelDev.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_IntNeu=nuclei_Neuronal.IntensityNeu.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_IntNeu=nuclei_Neuronal.IntensityNeu.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_SERSpot=nuclei_neuronal.SERSpot.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_SERSpot=nuclei_neuronal.SERSpot.@stddev;
+						
+							if(IN_SpotAnalysis1)
+								FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_IntSpot1=nuclei_Neuronal.IntensitySpot1.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_IntSpot1=nuclei_Neuronal.IntensitySpot1.@stddev;
+							End()
+							if(IN_SpotAnalysis2)
+								FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_IntSpot2=nuclei_Neuronal.IntensitySpot2.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_IntSpot2=nuclei_Neuronal.IntensitySpot2.@stddev;
+							End()
+
+						If(at("X1",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_IntX1=nuclei_Neuronal.IntensityX1.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_IntX1=nuclei_Neuronal.IntensityX1.@stddev;
+						End()
+						If(at("X2",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_IntX2=nuclei_Neuronal.IntensityX2.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_IntX2=nuclei_Neuronal.IntensityX2.@stddev;
+						End()
+						If(at("X3",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_IntX3=nuclei_Neuronal.IntensityX3.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_IntX3=nuclei_Neuronal.IntensityX3.@stddev;				
+						End()
+						If(at("X4",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_Neuronal_IntX4=nuclei_Neuronal.IntensityX4.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_Neuronal_IntX4=nuclei_Neuronal.IntensityX4.@stddev;				
+						End()	
+							
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_Count=nuclei_NonNeuronal.@count;
+						if(IN_ClusterAnalysis)
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_MinDistance=nuclei_NonNeuronal.NeighbourDistance.@mean*distanceSizeCalibration;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_MinDistance=nuclei_NonNeuronal.NeighbourDistance.@stddev*distanceSizeCalibration;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_NumberInCluster=nuclei_NonNeuronal.NumberOfObjectsInCluster.@mean;
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_NumberInCluster=nuclei_NonNeuronal.NumberOfObjectsInCluster.@stddev;
+						End()
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_Ratio=nuclei_NonNeuronal.@count/nuclei.@count;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_Area=nuclei_NonNeuronal.area.@mean*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_Area=nuclei_NonNeuronal.area.@stddev*areaSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_Perimeter=nuclei_NonNeuronal.border_area.@mean*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_Perimeter=nuclei_NonNeuronal.border_area.@stddev*distanceSizeCalibration;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_Roundness=nuclei_NonNeuronal.Compactness.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_Roundness=nuclei_NonNeuronal.Compactness.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_Int=nuclei_NonNeuronal.IntenMean.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_Int=nuclei_NonNeuronal.IntenMean.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_Int_relDev=nuclei_NonNeuronal.IntenRelDev.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_Int_relDev=nuclei_NonNeuronal.IntenRelDev.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_IntNeu=nuclei_NonNeuronal.IntensityNeu.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_IntNeu=nuclei_NonNeuronal.IntensityNeu.@stddev;
+						FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_SERSpot=nuclei_NonNeuronal.SERSpot.@mean;
+						FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_SERSpot=nuclei_NonNeuronal.SERSpot.@stddev;
+				
+						
+							if(IN_SpotAnalysis1)
+								FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_IntSpot1=nuclei_NonNeuronal.IntensitySpot1.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_IntSpot1=nuclei_NonNeuronal.IntensitySpot1.@stddev;
+							End()
+							if(IN_SpotAnalysis2)
+								FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_IntSpot2=nuclei_NonNeuronal.IntensitySpot2.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_IntSpot2=nuclei_NonNeuronal.IntensitySpot2.@stddev;
+							End()
+
+						If(at("X1",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_IntX1=nuclei_NonNeuronal.IntensityX1.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_IntX1=nuclei_NonNeuronal.IntensityX1.@stddev;
+						End()
+						If(at("X2",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_IntX2=nuclei_NonNeuronal.IntensityX2.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_IntX2=nuclei_NonNeuronal.IntensityX2.@stddev;
+						End()
+						If(at("X3",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_IntX3=nuclei_NonNeuronal.IntensityX3.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_IntX3=nuclei_NonNeuronal.IntensityX3.@stddev;				
+						End()
+						If(at("X4",channelNames))
+							FieldTable.FieldResults[_Field]._MEAN_Nuclei_NonNeuronal_IntX4=nuclei_NonNeuronal.IntensityX4.@mean;
+							FieldTable.FieldResults[_Field]._STDDEV_Nuclei_NonNeuronal_IntX4=nuclei_NonNeuronal.IntensityX4.@stddev;				
+						End()	
+
+						If(WF_Assay=="Connectivity")
+							If(IN_SpotAnalysis1)
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_Count=spot1.@count;
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_Int=spot1.Intensity.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Spot1_Int=spot1.Intensity.@stddev;
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_Area=spot1.Area.@mean*areaSizeCalibration;
+
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_DensityArea=spot1.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration);
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_DensityLength=spot1.@count/(skeleton.area.@mean*distanceSizeCalibration);
+								FieldTable.FieldResults[_Field]._MEAN_Neurite_IntSpot1=neurites.intensitySpot1.@mean;
+								
+								FieldTable.FieldResults[_Field]._MEAN_Neurite_IntBgSpot1=neurites.intensityBgSpot1;
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_SBR=spot1.Intensity.@mean/neurites.intensityBgSpot1;
+			
+							End()
+							if(IN_SpotAnalysis2)
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_Count=spot2.@count;
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_Int=spot2.Intensity.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Spot2_Int=spot2.Intensity.@stddev;
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_Area=spot2.Area.@mean*areaSizeCalibration;
+
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_DensityArea=spot2.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration);
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_DensityLength=spot2.@count/(skeleton.area.@mean*distanceSizeCalibration);
+								FieldTable.FieldResults[_Field]._MEAN_Neurite_IntSpot2=neurites.intensitySpot2.@mean;
+								
+								FieldTable.FieldResults[_Field]._MEAN_Neurite_IntBgSpot2=neurites.intensityBgSpot2;
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_SBR=spot2.Intensity.@mean/neurites.intensityBgSpot2;
+								
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_Overlap=spot1.overlap.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Spot1_Overlap=spot1.overlap.@stddev;
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_Overlap=spot2.overlap.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Spot2_Overlap=spot2.overlap.@stddev;
+								FieldTable.FieldResults[_Field]._MEAN_Spot1_PercWithOverlap=spot1PercWithOverlap;
+								FieldTable.FieldResults[_Field]._MEAN_Spot2_PercWithOverlap=spot2PercWithOverlap;
+								
+								FieldTable.FieldResults[_Field]._MEAN_Synapses_Count=synapses.@count;
+								FieldTable.FieldResults[_Field]._MEAN_Synapses_Density=synapses.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration);
+								FieldTable.FieldResults[_Field]._MEAN_Synapses_Area=synapses.area.@mean*areaSizeCalibration;
+								FieldTable.FieldResults[_Field]._STDDEV_Synapses_Area=synapses.area.@stddev*areaSizeCalibration;
+								FieldTable.FieldResults[_Field]._MEAN_Synapses_IntRatio=synapses.IntRatio.@mean;
+								FieldTable.FieldResults[_Field]._STDDEV_Synapses_IntRatio=synapses.IntRatio.@stddev;
+								
+								FieldTable.FieldResults[_Field]._MEAN_PearsonCorr=pearsonCorr;
+								FieldTable.FieldResults[_Field]._MEAN_SimilarityIndex=similarityIndex;
+								//FieldTable.FieldResults[_Field]._MEAN_RWC1=RWC1;
+								//FieldTable.FieldResults[_Field]._MEAN_RWC2=RWC2;
+							End()
+						End()
+						
+						//-----Store WellData-----//
+						collectWellResults(variable="_MEAN_ChannelNuclei_Intensity",vec=textureImgNuc.int.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNuclei_Intensity",vec=textureImgNuc.int.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNuclei_IntensityStddev",vec=textureImgNuc.int_stddev.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNuclei_IntensityStddev",vec=textureImgNuc.int_stddev.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNuclei_Contrast",vec=textureImgNuc.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNuclei_Contrast",vec=textureImgNuc.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNuclei_Correlation",vec=textureImgNuc.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNuclei_Correlation",vec=textureImgNuc.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNuclei_Homogeneity",vec=textureImgNuc.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNuclei_Homogeneity",vec=textureImgNuc.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNuclei_SumVariance",vec=textureImgNuc.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNuclei_SumVariance",vec=textureImgNuc.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+						
+						collectWellResults(variable="_MEAN_ChannelNeurite_Intensity",vec=textureImgNeu.int.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNeurite_Intensity",vec=textureImgNeu.int.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_channelNeurite_IntensityStddev",vec=textureImgNeu.int_stddev.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNeurite_IntensityStddev",vec=textureImgNeu.int_stddev.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNeurite_Contrast",vec=textureImgNeu.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNeurite_Contrast",vec=textureImgNeu.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNeurite_Correlation",vec=textureImgNeu.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNeurite_Correlation",vec=textureImgNeu.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNeurite_Homogeneity",vec=textureImgNeu.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNeurite_Homogeneity",vec=textureImgNeu.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_ChannelNeurite_SumVariance",vec=textureImgNeu.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_ChannelNeurite_SumVariance",vec=textureImgNeu.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+						
+						if(IN_SpotAnalysis1)
+							collectWellResults(variable="_MEAN_ChannelSpot1_Intensity",vec=textureImgSpot1.int.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot1_Intensity",vec=textureImgSpot1.int.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot1_IntensityStddev",vec=textureImgSpot1.int_stddev.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot1_IntensityStddev",vec=textureImgSpot1.int_stddev.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot1_Contrast",vec=textureImgSpot1.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot1_Contrast",vec=textureImgSpot1.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot1_Correlation",vec=textureImgSpot1.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot1_Correlation",vec=textureImgSpot1.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot1_Homogeneity",vec=textureImgSpot1.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot1_Homogeneity",vec=textureImgSpot1.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot1_SumVariance",vec=textureImgSpot1.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot1_SumVariance",vec=textureImgSpot1.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+						End()
+						If(IN_SpotAnalysis2)
+							collectWellResults(variable="_MEAN_ChannelSpot2_Intensity",vec=textureImgSpot2.int.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot2_Intensity",vec=textureImgSpot2.int.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot2_IntensityStddev",vec=textureImgSpot2.int_stddev.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot2_IntensityStddev",vec=textureImgSpot2.int_stddev.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot2_Contrast",vec=textureImgSpot2.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot2_Contrast",vec=textureImgSpot2.HaralickContrast.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot2_Correlation",vec=textureImgSpot2.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot2_Correlation",vec=textureImgSpot2.HaralickCorrelation.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot2_Homogeneity",vec=textureImgSpot2.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot2_Homogeneity",vec=textureImgSpot2.HaralickHomogeneity.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_ChannelSpot2_SumVariance",vec=textureImgSpot2.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_ChannelSpot2_SumVariance",vec=textureImgSpot2.HaralickSumVariance.@mean,wellResults=wellResults | wellResults)
+						End()
+							
+						collectWellResults(variable="_MEAN_Neurite_Area",vec=neurites.area.@mean*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_Area",vec=neurites.area.@mean*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_AreaSearch",vec=neurites.searchRegion.Area.@mean*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_AreaSearch",vec=neurites.searchRegion.Area.@mean*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_Int",vec=neurites.intensityNeu.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_Int",vec=neurites.intensityNeu.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_Int_Sd",vec=neurites.intensityNeu_stddev.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_Int_Sd",vec=neurites.intensityNeu_stddev.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_Length",vec=skeleton.area.@mean*distanceSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_Length",vec=skeleton.area.@mean*distanceSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_Width_Mean",vec=skeleton.dendrite_meanwidth.@mean*distanceSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_Width_Mean",vec=skeleton.dendrite_meanwidth.@mean*distanceSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_Width_Max",vec=skeleton.dendrite_maxwidth.@mean*distanceSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_Width_Max",vec=skeleton.dendrite_maxwidth.@mean*distanceSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_Nodes",vec=skeleton.skeleton_node_count.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_Nodes",vec=skeleton.skeleton_node_count.@mean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Neurite_AreaPerNucleus",vec=neurites.area.@mean*areaSizeCalibration/nuclei_neuronal.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_AreaPerNucleus",vec=neurites.area.@mean*areaSizeCalibration/nuclei_neuronal.@count,wellResults=wellResults | wellResults)						
+						collectWellResults(variable="_MEAN_Neurite_LengthPerNucleus",vec=skeleton.area.@mean*distanceSizeCalibration/nuclei_neuronal.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Neurite_LengthPerNucleus",vec=skeleton.area.@mean*distanceSizeCalibration/nuclei_neuronal.@count,wellResults=wellResults | wellResults)	
+						
+						If(at("X1",channelNames))
+							collectWellResults(variable="_MEAN_Neurite_IntX1",vec=neurites.IntensityX1,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Neurite_IntX1",vec=neurites.IntensityX1,wellResults=wellResults | wellResults)
+						End()
+						If(at("X2",channelNames))
+							collectWellResults(variable="_MEAN_Neurite_IntX2",vec=neurites.IntensityX2,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Neurite_IntX2",vec=neurites.IntensityX2,wellResults=wellResults | wellResults)
+						End()
+						If(at("X3",channelNames))
+							collectWellResults(variable="_MEAN_Neurite_IntX3",vec=neurites.IntensityX3,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Neurite_IntX3",vec=neurites.IntensityX3,wellResults=wellResults | wellResults)
+						End()
+						If(at("X4",channelNames))
+							collectWellResults(variable="_MEAN_Neurite_IntX4",vec=neurites.IntensityX4,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Neurite_IntX4",vec=neurites.IntensityX4,wellResults=wellResults | wellResults)
+						End()	
+
+						collectWellResults(variable="_MEAN_Nuclei_Count",vec=nuclei.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Count",vec=nuclei.@count,wellResults=wellResults | wellResults)
+						if(IN_ClusterAnalysis)
+							collectWellResults(variable="_MEAN_Nuclei_MinDistance",vec=nuclei.NeighbourDistance,wellResults=wellResults | wellResults)	
+							collectWellResults(variable="_STDDEV_Nuclei_MinDistance",vec=nuclei.NeighbourDistance,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_Nuclei_NumberInCluster",vec=nuclei.NumberOfObjectsInCluster,wellResults=wellResults | wellResults)	
+							collectWellResults(variable="_STDDEV_Nuclei_NumberInCluster",vec=nuclei.NumberOfObjectsInCluster,wellResults=wellResults | wellResults)			
+						End()			
+						collectWellResults(variable="_MEAN_Nuclei_Area",vec=nuclei.area*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Area",vec=nuclei.area*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Perimeter",vec=nuclei.border_area,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Perimeter",vec=nuclei.border_area,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Roundness",vec=nuclei.Compactness,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Roundness",vec=nuclei.Compactness,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Int",vec=nuclei.IntenMean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Int",vec=nuclei.IntenMean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Int_relDev",vec=nuclei.IntenRelDev,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Int_relDev",vec=nuclei.IntenRelDev,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_IntNeu",vec=nuclei.IntensityNeu,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_IntNeu",vec=nuclei.IntensityNeu,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_SERSpot",vec=nuclei.SERSpot,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_SERSpot",vec=nuclei.SERSpot,wellResults=wellResults | wellResults)
+						
+						If(IN_SpotAnalysis1)
+							collectWellResults(variable="_MEAN_Nuclei_IntSpot1",vec=nuclei.IntensitySpot1,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_IntSpot1",vec=nuclei.IntensitySpot1,wellResults=wellResults | wellResults)
+						End()
+						If(IN_SpotAnalysis2)
+							collectWellResults(variable="_MEAN_Nuclei_IntSpot2",vec=nuclei.IntensitySpot2,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_IntSpot2",vec=nuclei.IntensitySpot2,wellResults=wellResults | wellResults)
+						End()
+
+						If(at("X1",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_IntX1",vec=nuclei.IntensityX1,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_IntX1",vec=nuclei.IntensityX1,wellResults=wellResults | wellResults)
+						End()
+						If(at("X2",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_IntX2",vec=nuclei.IntensityX2,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_IntX2",vec=nuclei.IntensityX2,wellResults=wellResults | wellResults)
+						End()
+						If(at("X3",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_IntX3",vec=nuclei.IntensityX3,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_IntX3",vec=nuclei.IntensityX3,wellResults=wellResults | wellResults)
+						End()
+						If(at("X4",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_IntX4",vec=nuclei.IntensityX4,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_IntX4",vec=nuclei.IntensityX4,wellResults=wellResults | wellResults)
+						End()	
+							
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_Count",vec=nuclei_neuronal.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_Count",vec=nuclei_neuronal.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_Ratio",vec=nuclei_neuronal.@count/nuclei.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_Ratio",vec=nuclei_neuronal.@count/nuclei.@count,wellResults=wellResults | wellResults)
+						if(IN_ClusterAnalysis)
+							collectWellResults(variable="_MEAN_Nuclei_Neuronal_MinDistance",vec=nuclei_neuronal.NeighbourDistance,wellResults=wellResults | wellResults)	
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_MinDistance",vec=nuclei_neuronal.NeighbourDistance,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_Nuclei_Neuronal_NumberInCluster",vec=nuclei_neuronal.NumberOfObjectsInCluster,wellResults=wellResults | wellResults)	
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_NumberInCluster",vec=nuclei_neuronal.NumberOfObjectsInCluster,wellResults=wellResults | wellResults)	
+						End()
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_Area",vec=nuclei_neuronal.area*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_Area",vec=nuclei_neuronal.area*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_Perimeter",vec=nuclei_neuronal.border_area,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_Perimeter",vec=nuclei_neuronal.border_area,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_Roundness",vec=nuclei_neuronal.Compactness,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_Roundness",vec=nuclei_neuronal.Compactness,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_Int",vec=nuclei_neuronal.IntenMean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_Int",vec=nuclei_neuronal.IntenMean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_Int_relDev",vec=nuclei_neuronal.IntenRelDev,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_Int_relDev",vec=nuclei_neuronal.IntenRelDev,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_IntNeu",vec=nuclei_Neuronal.IntensityNeu,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_IntNeu",vec=nuclei_Neuronal.IntensityNeu,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_Neuronal_SERSpot",vec=nuclei_neuronal.SERSpot,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_Neuronal_SERSpot",vec=nuclei_neuronal.SERSpot,wellResults=wellResults | wellResults)
+						
+						
+						If(IN_SpotAnalysis1)
+							collectWellResults(variable="_MEAN_Nuclei_Neuronal_IntSpot1",vec=nuclei_Neuronal.IntensitySpot1,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_IntSpot1",vec=nuclei_Neuronal.IntensitySpot1,wellResults=wellResults | wellResults)
+						End()
+						If(IN_SpotAnalysis2)
+							collectWellResults(variable="_MEAN_Nuclei_Neuronal_IntSpot2",vec=nuclei_Neuronal.IntensitySpot2,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_IntSpot2",vec=nuclei_Neuronal.IntensitySpot2,wellResults=wellResults | wellResults)
+						End()
+			
+						If(at("X1",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_Neuronal_IntX1",vec=nuclei_Neuronal.IntensityX1,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_IntX1",vec=nuclei_Neuronal.IntensityX1,wellResults=wellResults | wellResults)
+						End()
+						If(at("X2",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_Neuronal_IntX2",vec=nuclei_Neuronal.IntensityX2,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_IntX2",vec=nuclei_Neuronal.IntensityX2,wellResults=wellResults | wellResults)
+						End()
+						If(at("X3",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_Neuronali_IntX3",vec=nuclei_Neuronal.IntensityX3,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_IntX3",vec=nuclei_Neuronal.IntensityX3,wellResults=wellResults | wellResults)
+						End()
+						If(at("X4",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_Neuronal_IntX4",vec=nuclei_Neuronal.IntensityX4,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_Neuronal_IntX4",vec=nuclei_Neuronal.IntensityX4,wellResults=wellResults | wellResults)
+						End()							
+							
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_Count",vec=nuclei_NonNeuronal.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Count",vec=nuclei_NonNeuronal.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_Ratio",vec=nuclei_NonNeuronal.@count/nuclei.@count,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Ratio",vec=nuclei_NonNeuronal.@count/nuclei.@count,wellResults=wellResults | wellResults)
+						if(IN_ClusterAnalysis)
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_MinDistance",vec=nuclei_NonNeuronal.NeighbourDistance,wellResults=wellResults | wellResults)	
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_MinDistance",vec=nuclei_NonNeuronal.NeighbourDistance,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_NumberInCluster",vec=nuclei_NonNeuronal.NumberOfObjectsInCluster,wellResults=wellResults | wellResults)	
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_NumberInCluster",vec=nuclei_NonNeuronal.NumberOfObjectsInCluster,wellResults=wellResults | wellResults)	
+						End()
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_Area",vec=nuclei_NonNeuronal.area*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Area",vec=nuclei_NonNeuronal.area*areaSizeCalibration,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_Perimeter",vec=nuclei_NonNeuronal.border_area,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Perimeter",vec=nuclei_NonNeuronal.border_area,wellResults=wellResults | wellResults)		
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_Roundness",vec=nuclei_NonNeuronal.Compactness,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Roundness",vec=nuclei_NonNeuronal.Compactness,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_Int",vec=nuclei_NonNeuronal.IntenMean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Int",vec=nuclei_NonNeuronal.IntenMean,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_Int_relDev",vec=nuclei_NonNeuronal.IntenRelDev,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Int_relDev",vec=nuclei_NonNeuronal.IntenRelDev,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_IntNeu",vec=nuclei_NonNeuronal.IntensityNeu,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_IntNeu",vec=nuclei_NonNeuronal.IntensityNeu,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_SERSpot",vec=nuclei_NonNeuronal.SERSpot,wellResults=wellResults | wellResults)
+						collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_SERSpot",vec=nuclei_NonNeuronal.SERSpot,wellResults=wellResults | wellResults)
+						
+						If(IN_SpotAnalysis1)
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_IntSpot1",vec=nuclei_NonNeuronal.IntensitySpot1,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_IntSpot1",vec=nuclei_NonNeuronal.IntensitySpot1,wellResults=wellResults | wellResults)
+						End()
+						If(IN_SpotAnalysis2)
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_IntSpot2",vec=nuclei_NonNeuronal.IntensitySpot2,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_IntSpot2",vec=nuclei_NonNeuronal.IntensitySpot2,wellResults=wellResults | wellResults)
+						End()
+					
+						If(at("X1",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_IntX1",vec=nuclei_NonNeuronal.IntensityX1,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeurona_IntX1",vec=nuclei_NonNeuronal.IntensityX1,wellResults=wellResults | wellResults)
+						End()
+						If(at("X2",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_IntX2",vec=nuclei_NonNeuronal.IntensityX2,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_Nuclei_IntX2",vec=nuclei_NonNeuronal.IntensityX2,wellResults=wellResults | wellResults)
+						End()
+						If(at("X3",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_IntX3",vec=nuclei_NonNeuronal.IntensityX3,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_IntX3",vec=nuclei_NonNeuronal.IntensityX3,wellResults=wellResults | wellResults)
+						End()
+						If(at("X4",channelNames))
+							collectWellResults(variable="_MEAN_Nuclei_NonNeuronal_IntX4",vec=nuclei_NonNeuronal.IntensityX4,wellResults=wellResults | wellResults)
+							collectWellResults(variable="_STDDEV_Nuclei_NonNeuronal_IntX4",vec=nuclei_NonNeuronal.IntensityX4,wellResults=wellResults | wellResults)
+						End()				
+
+						If(WF_Assay=="Connectivity")
+							If(IN_SpotAnalysis1)
+								collectWellResults(variable="_MEAN_Spot1_Count",vec=spot1.@count, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_Count",vec=spot1.@count, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot1_Area",vec=spot1.Area*areaSizeCalibration, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_Area",vec=spot1.Area*areaSizeCalibration, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Neurite_IntSpot1",vec=neurites.intensitySpot1,wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Neurite_IntSpot1",vec=neurites.intensitySpot1,wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot1_Int",vec=spot1.Intensity, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_Int",vec=spot1.Intensity, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Neurite_IntBgSpot1",vec=neurites.intensityBgSpot1, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Neurite_IntBgSpot1",vec=neurites.intensityBgSpot1, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot1_SBR",vec=spot1.Intensity.@mean/neurites.intensityBgSpot1, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_SBR",vec=spot1.Intensity.@mean/neurites.intensityBgSpot1, wellResults=wellResults | wellResults)							
+								collectWellResults(variable="_MEAN_Spot1_DensityArea",vec=spot1.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_DensityArea",vec=spot1.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot1_DensityLength",vec=spot1.@count/(skeleton.area.@mean*distanceSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_DensityLength",vec=spot1.@count/(skeleton.area.@mean*distanceSizeCalibration), wellResults=wellResults | wellResults)
+							End()
+							if(IN_SpotAnalysis2)
+								collectWellResults(variable="_MEAN_Spot2_Count",vec=spot2.@count, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_Count",vec=spot2.@count, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot2_Area",vec=spot2.Area*areaSizeCalibration, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_Area",vec=spot2.Area*areaSizeCalibration, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Neurite_IntSpot2",vec=neurites.intensitySpot2,wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Neurite_IntSpot2",vec=neurites.intensitySpot2,wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot2_Int",vec=spot2.Intensity, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_Int",vec=spot2.Intensity, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Neurite_IntBgSpot2",vec=neurites.intensityBgSpot2, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Neurite_IntBgSpot2",vec=neurites.intensityBgSpot2, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot2_SBR",vec=spot2.Intensity.@mean/neurites.intensityBgSpot2, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_SBR",vec=spot2.Intensity.@mean/neurites.intensityBgSpot2, wellResults=wellResults | wellResults)	
+								collectWellResults(variable="_MEAN_Spot2_DensityArea",vec=spot2.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_DensityArea",vec=spot2.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot2_DensityLength",vec=spot2.@count/(skeleton.area.@mean*distanceSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_DensityLength",vec=spot2.@count/(skeleton.area.@mean*distanceSizeCalibration), wellResults=wellResults | wellResults)
+
+								collectWellResults(variable="_MEAN_Spot1_Overlap",vec=spot1.overlap, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_Overlap",vec=spot1.overlap, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot2_Overlap",vec=spot2.overlap, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_Overlap",vec=spot2.overlap, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot1_percWithOverlap",vec=spot1PercWithOverlap, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot1_percWithOverlap",vec=spot1PercWithOverlap, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Spot2_percWithOverlap",vec=spot2percWithOverlap, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Spot2_PercWithOverlap",vec=spot2PercWithOverlap, wellResults=wellResults | wellResults)
+								
+								collectWellResults(variable="_MEAN_Synapses_Count",vec=synapses.@count, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Synapses_Count",vec=synapses.@count, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Synapses_Density",vec=synapses.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Synapses_Density",vec=synapses.@count/(neurites.searchRegion.Area.@mean*areaSizeCalibration), wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Synapses_Area",vec=synapses.area*areaSizeCalibration, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Synapses_Area",vec=synapses.area*areaSizeCalibration, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_Synapses_IntRatio",vec=synapses.IntRatio, wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_Synapses_IntRatio",vec=synapses.IntRatio, wellResults=wellResults | wellResults)
+						
+								collectWellResults(variable="_MEAN_PearsonCorr",vec=pearsonCorr,wellResults=wellResults | wellResults)
+								collectWellResults(variable="_STDDEV_PearsonCorr",vec=pearsonCorr,wellResults=wellResults | wellResults)
+								collectWellResults(variable="_MEAN_SimilarityIndex",vec=similarityIndex,wellResults=wellResults | wellResults)	
+								collectWellResults(variable="_STDDEV_SimilarityIndex",vec=similarityIndex,wellResults=wellResults | wellResults)
+								//collectWellResults(variable="_MEAN_RWC1",vec=RWC1,wellResults=wellResults | wellResults)	
+								//collectWellResults(variable="_STDDEV_RWC1",vec=RWC1,wellResults=wellResults | wellResults)	
+								//collectWellResults(variable="_MEAN_RWC2",vec=RWC2,wellResults=wellResults | wellResults)	
+								//collectWellResults(variable="_STDDEV_RWC2",vec=RWC2,wellResults=wellResults | wellResults)		
+							End()
+						End()
+					END()
+				End()
+			End()
+		End()
+	}
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// START PROCEDURES NUCLEI
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+proc detectNuclei(
+	image imgNuc in "image nuclei",
+	double threshold in "threshold image",
+	double sizeKernel in "sizeKernel",
+	double minAreaPx in "minAreaPx",
+	double splitFactor in "splitFactor",
+	objectlist nuclei out "objectlist nuclei",)
+	{	
+		Median(image=imgNuc,edge=sizeKernel | imgFilter=image)
+		Mask(threshold=threshold, image=imgFilter | maskNuc= mask)
+		Mask2Stencil(Mask=maskNuc, Method="Joint clusters" | stencilNuc = stencil)
+		Stencil2Objects(Stencil=stencilNuc | nucleiAll=objects)
+		SplitObjects(MinimumArea= minAreaPx, RelativeLengthLimit= splitFactor, BinningFactor=1, objects=nucleiAll | nucleiWS=objects )
+		RemoveBorderObjects(5,objects=nucleiWS | nuclei=objects)
+	}
+	
+	proc MaskToDistanceImage(
+	image ObjectMask explicit in,
+	double MaxDistance=100 explicit in,
+	image DistanceImage out)
+	Detection [hidden] "Calculation of distance image from a mask image via SlidingParabolaErosion"
+	{
+	///// For a given object mask, calculate distance image
+		set(width=ObjectMask.width, height=ObjectMask.height)
+		cropany(ObjectMask, vec(1,1), vec(width-1, height-1) | maskS=result)
+		Redimension(width, height, 1,1, BackgroundMethod="Mirror", image=maskS | maskM=image)
+	//	if(!defined("MaxDistance")) set(MaxDistance=100) end()
+		set(aa=2.0/(MaxDistance*MaxDistance))
+		SlidingParabolaErosion(maskM, aa)
+		company("sqrt(2*abs(result)/aa)" | DistanceImage=result)
+		convelems(DistanceImage, "integer", 2, "unsigned", clipoutofrange=1, stretchdynamic=1 | DistanceImage=result)
+	}
+	
+	proc ClusterAnalysis(
+		objectlist objects explicit in,
+		double IN_max_dist=12 explicit in,
+		objectlist objects  out,
+		objectlist clusters out)
+	{
+		// Find clusters: blow the cells up and see if they touch
+		CalcErosion( Objects=objects, ErosionDistance=-IN_max_dist/2  | Objects=Objects )    												// blow up
+		CalcBorder( Objects=objects, Stencil=Eroded | Objects=Objects )
+		Erosion( image=objects.eroded.mask.image | Image=Image)    																					// blow up common borders
+		And( mask=objects.Eroded_border.mask.image, image=image | Image=Image )
+		CalcStat(Measure= "max", AttrName="hasNeighbour", Stencil=Eroded_border , Objects=Objects | Objects=Objects)	// 1 if there is a common border pixel
+
+		// Recluster
+		mask2stencil(Mask=objects.eroded.mask | Stencil=Stencil) 
+		stencil2objects(Stencil=Stencil | clusters=objects)
+		
+		//Number of Objects in Cluster
+		CalcMassCentre(Stencil=body,Objects=objects | objects=objects)
+		CalcStat(Measure="sum", AttrName= "NumberOfObjects", image=objects.MassCentre.mask.image, stencil=body,Objects=Clusters | Clusters=Objects) 
+
+		// Add cluster number attribute to each object
+		set(image=clusters.index)	// start from index image
+		if( defined ("AllCells.ClusterNo.max") )	// continous numbers for multifield images
+			Add( AllCells.ClusterNo.max )
+			And( clusters.body.mask.image )	// set everything outside the clusters to zero again
+		End()
+		CalcStat(Measure="median", Image=clusters.index ,AttrName="ClusterNo", objects=objects  | Objects=Objects)
+		
+		//Link number of objects in cluster to each object	
+		CalcAttr(Attrname="NumberOfObjectsInCluster",Formula=0, Objects=objects | Objects=Objects)																						
+		Foreach(0..(objects.@count-1),"index")
+			clusterIndex=objects.ClusterNo[index]-1;
+			objects.NumberOfObjectsInCluster[index] = clusters.numberOfObjects[clusterIndex];		
+		End()
+	}
+	
+	proc NearestNeighbourDistance(
+	string StencilName="body" noquote in "Name of the stencil type attribute in the input object list for which the equivalent ellipses are calculated.",
+	int MaximumDistance=100 in "Maximum distance to determine. The calculation time might increase drastically if this is set too large. If a value close to this maximum distance is returned for an object, that object is basically isolated.",
+	objectlist objects in "Input object list. ",
+	objectlist objects out "Output object list. The procedure adds to the list the distance to the nearest neighbour: \"NeighbourDistance\". If the distance is not calculated for the \"body\" the resultant attribute will be prepended with the stencil name.",
+) object list attribute creation "Determine for the stencil of the object list the nearest neighbour and add it to the object list as a new attribute. "
+{
+	Set(objects1=objects)
+	try()
+		stencil2objects(objects[stencilName])
+	catch_error()
+		error("Attribute with name " & StencilName & " is not present in the input object list or has a wrong type, i.e. is not a stencil. Control the input StencilName.")
+	end()
+
+	Set(O1 = objects)
+	
+	//Enlarge image with 1 px at each side
+	Enlarge(EnlargeEdge=1, Image=objects.body.image, BackgroundMethod="BackValue" | Image)
+	Stencil2Objects(Stencil=image  | Objects)
+	
+	//Create zoneimage and distanceimage of maxDistance/2
+	set(NumberOfOuterZones=1+MaximumDistance/2)
+	CalcZone(Objects=Objects, ZoneType="equidistant"  | Objects)
+	ZoneMask(filt_low=-(MaximumDistance/2), filt_high=inf, objects=objects  | Objects)
+	ZoneImage(Objects=objects, ZoneType="OuterZones" | ZoneImage)
+	DistanceImage(zoneimage=zoneimage | DistanceImage)
+	
+	//Crop dark border
+	Redimension(Width=distanceImage.width-2, Height=distanceImage.height-2, ShiftX=-1, ShiftY=-1,Image=distanceImage | Image)
+	Set(distanceImage = image )
+	
+	//Get Border of zonemasks > Crop > Measure min intensity of border zone in distanceImage > *2 = min Distance 
+	CalcBorder(Stencil=zonemask, objects=objects  | Objects)
+	Redimension(Width=distanceImage.width, Height=distanceImage.height,ShiftX=-1, ShiftY=-1, Image=objects.zonemask_border.Image | Image)
+	ClearBorders(Stencil=image  | Stencil)
+	SetAttr(AttrName="zonemask_border", Value= stencil.vector, objects=O1 | Objects)
+	CalcStat(Measure="min", Stencil=zonemask_border, AttrName="NeighbourDistance", Image=distanceimage, Objects = Objects  | Objects)
+	CalcAttr(Attrname="NeighbourDistance", Formula=NeighbourDistance*2  | Objects)
+	Set(objects2 = objects)
+
+	// Insert the new attribute into the original object list provided
+	Set(BaseName = iif(stencilName=="body","",stencilName&"_"))
+	SetAttr(AttrName=BaseName&"NeighbourDistance",Value=objects2.NeighbourDistance,objects=objects1  | Objects)
+}
+
+	
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// STOP PROCEDURES NUCLEI
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// START PROCEDURES NEURITES
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+proc detectNeuriteMask(
+	image imgNeu in "imageNeu",
+	double scaleGaussian in "scaleGaussian",
+	double threshold in "threshold",
+	double thresholdFrangi in "thresholdFrangi",
+	int frangiStart in "frangiStart",
+	int frangiStepSize in "frangiStepSize",
+	int frangiNumberSteps in "frangiNumberSteps",
+	image maskNeu out "maskNeu",
+	image imgFrangi out "imgFrangi",
+	image imgNeu_Result_Mask out "imgNeu_Result_Mask",)
+	{
+		//Threshold
+		Texture::Gaussian1stDerivFilter(imgNeu,scaleGaussian | gauss = L0)
+		Mask(threshold=threshold, image=gauss | maskThreshold = mask)
+		Mask2Stencil(Mask= maskThreshold, Method="One large object" | stencilThreshold= stencil)
+
+		//Frangi
+		Set(sigma=vec())
+		Foreach(range(0,frangiNumberSteps),"i")
+			Push(sigma, frangiStart + frangiStepSize*(i))
+		End()
+		//Set(sigma=vec(1,3,5,7,9,11))
+		Mask(0, image=imgNeu | mask=mask)
+		set(imgFiltered=filledvec(sigma.@length, mask.@image))
+		Set(i=0)
+		Foreach(sigma,"s")
+			//2nd Deriv
+			Texture::Gaussian2ndDerivFilter(image=gauss, scale=s | Lxx, Lxy, Lyy, E1, E2)
+			//Texture::Gaussian2ndDerivFilter(image=imgNeu, scale=s | Lxx, Lxy, Lyy, E1, E2)
+			//Correct for scale
+			Set(Dxx=s^2*Lxx)
+			Set(Dxy=s^2*Lxy)
+			Set(Dyy=s^2*Lyy)
+			
+			Set(beta=2*0.5^2)
+			Set(c=2*15^2)
+			
+			Set(Rb=(E1/E2)^2)
+			Set(S2=E1^2+E2^2)
+					
+			imgTemp=(exp(-Rb/beta)*(mask.@image-exp(-S2/c)));
+			Set(imgFiltered[i]=imgTemp)
+			Set(i=i+1)
+		End()
+		Stat::Projection(imgFiltered,Method="max" | imgFrangi=result)
+		Mask(threshold=thresholdFrangi, image=imgFrangi  | maskFrangi= mask)
+		Mask2Stencil(Mask=maskFrangi, Method="One large object" | stencilFrangi= stencil)
+		
+		Or(image=maskThreshold.@image, mask=maskFrangi  | maskNeu = image)
+
+	    set(maskNeuFinal=maskNeu)
+		Mask2Stencil(Mask=maskNeuFinal, Method="One large object" | stencilNeuriteFinal= stencil)
+		Stencil2Objects(Stencil=stencilNeuriteFinal | neurites=objects)	
+		
+		Set(maskNeu=neurites.body.@image)
+		
+		CarryObjects(Stencil=stencilThreshold, Data="red", image=imgNeu  | imgNeu_Result_mask = image)
+		CarryObjects(Stencil=stencilFrangi, Data="yellow", image=imgNeu_Result_mask  | imgNeu_Result_mask = image)
+	}
+
+proc detectNeurites(
+	image maskNeu in "maskNeu",
+	objectlist nuclei in "nuclei",
+	objectlist neurites out "neurites",)
+	{
+		Or(image=maskNeu.@image, mask=nuclei.body.@mask.@array  | maskNeurites = image)
+        Mask2Stencil(Mask=maskNeurites, Method="Joint Clusters" | stencilNeurite = stencil)
+		Stencil2Objects(Stencil=stencilNeurite | neurites=objects)
+		CalcArea(Stencil=border, objects=neurites| neurites=objects)
+		CalcAttr("Roundness", 4*Pi*area/(1.0*border_area*border_area), AutoRecalc=no,objects=neurites| neurites=objects)
+		ObjectFilter("Roundness<"&0.3, Objects=neurites  | neuritesFiltered=objects)
+		Mask(threshold=1, image=neuritesFiltered.body.@array | maskNeuFilt = mask)
+		Mask2Stencil(Mask=maskNeuFilt, Method="One large object" | stencilNeuriteFinal= stencil)
+		Stencil2Objects(Stencil=stencilNeuriteFinal | neurites=objects)	
+	}
+	
+proc Skeleton(
+	Image imgNeu in "imageNeu",
+	ObjectList nuclei in "neuronalNuclei",
+	ObjectList neurites in "neurites",
+	double dilationPx in "dilationPx",
+	double minAreaPx in "minAreaPx",
+	objectlist skeleton out "new objectlist with each object represents one dendrite fragment"
+)
+{
+	GetSys(EVT_Workflow)
+	set(EVT_Visualization=at("Visualization",EVT_Workflow))
+	set(EVT_Debug=at("Debug",EVT_Workflow))
+	
+	//Exclude nuclei
+	CalcErosion(ErosionDistance=2*dilationPx, Stencil=body, Objects=nuclei | nuclei = Objects)
+	NOT(image=nuclei.eroded.@mask.@array | image1=image)
+	AND(mask=neurites.body, image=image1 | image)
+	Stencil::CreateFromArray(Array=image, ObjectCount=1 | stencil )
+	stencil2objects(Stencil | neurites=objects)
+	Delete(image1,image, nuclei, wholeImage, mask,maskNeurites)
+	
+	CalcZone(Stencil=body, NumberOfOuterZones=0,ZoneType="equidistant",Objects=neurites | neurites=objects)
+	ZoneImage(objects=neurites, ZoneType="InnerZones"  | zoneimage)
+	DistanceImage(zoneimage=zoneimage  | distanceimage )
+	
+	//*******Calculate skeleton
+	CalcSkeleton(Stencil=body,Objects=neurites | skeleton=objects)
+	skeletonBefore=skeleton.skeleton;
+	
+	//*******Prune Skeleton
+	set(image=skeleton.skeleton.mask.image)
+	set(B=vec(1,1,1,1,9,1,1,1,1))
+	set(convolutionkernel=toimage(B,3,3).image)
+	set(convolutionkernelfactor=1)
+	set(s=image.sum)
+	set(i=zoneimage.max)
+	while(i>0)
+		convolution(ConvolutionKernel=ConvolutionKernel,ConvolutionKernelFactor=ConvolutionKernelFactor,image=image)
+		//******* 11 = 9 (center points) + at least 2 connecting lines
+		Mask(11,image=image)
+		set(image=mask.image)
+		if(s==image.sum)
+			set(i=0)
+		else()
+			set(i=i-1)
+		end()
+		set(s=image.sum)
+	end()
+	
+	if(skeleton.area.@mean!=0)
+		maskSkeletonAfter=mask;
+		
+		//*******Remove 1 px knicks in skeleton
+		convolution(ConvolutionKernel=ConvolutionKernel,ConvolutionKernelFactor=ConvolutionKernelFactor,image=maskSkeletonAfter.@image)
+		Mask(12,image=image)
+		Minus(x=maskSkeletonAfter.image,y=mask.image | result)
+		
+		//*******Remove 1 px blocks
+		convolution(ConvolutionKernel=ConvolutionKernel,ConvolutionKernelFactor=ConvolutionKernelFactor,image=result)
+		Mask(10,image=image)
+		Mask2Stencil(Mask=mask, Method="One large object" | stencil)
+		Stencil2Objects(Stencil=stencil | objects)	
+		
+		//*******Fill Gaps
+		Erosion(image=objects.body.@array, magnitude=-3 | image)
+		Mask(1,image=image | mask)
+		Mask2Stencil(Mask=mask, Method="One large object" | stencil)
+		Stencil2Objects(Stencil=stencil | objects)		
+		
+		//*******Recalculate Skeleton
+		CalcSkeleton(Stencil=body,Objects=objects | skeleton=objects)
+		CalcNodes(Stencil=skeleton,Objects=skeleton | skeleton=objects)
+		
+		//******* Remove small forkes at the end
+		Inverse(image=skeleton.skeleton_nodes.@image | nodesInvert=image)
+		AND(mask=skeleton.skeleton.mask, image=nodesInvert | image)
+		Mask(1,image=image | mask)
+		Mask2Stencil(Mask=mask, Neighborhood="corner" | stencil)
+		Stencil2Objects(Stencil=stencil | objects)	
+		ObjectFilter("Area>"&minAreaPx, objects=objects | objects = objects)
+
+		//*******Recalculate Skeleton by including nodes
+		OR(mask=objects.body.@mask, image=skeleton.skeleton_nodes.@image | image)
+		Mask(1,image=image | mask)
+		Mask2Stencil(Mask=mask, Method="One large object" | stencil)
+		Stencil2Objects(Stencil=stencil | objects)	
+		CalcSkeleton(Stencil=body,Objects=objects | skeleton=objects)
+		CalcNodes(Stencil=skeleton,Objects=skeleton | skeleton=objects)
+	
+		//*******Measurements
+		CalcStat("Max",Stencil=skeleton,AttrName="dendrite_maxwidth",image=distanceimage, objects=skeleton | skeleton=objects)
+		CalcStat("Min",Stencil=skeleton,AttrName="dendrite_minwidth",image=distanceimage, objects=skeleton | skeleton=objects)
+		CalcStat("Median",Stencil=skeleton,AttrName="dendrite_medianwidth",image=distanceimage, objects=skeleton | skeleton=objects)
+		CalcStat("Mean",Stencil=skeleton,AttrName="dendrite_meanwidth",image=distanceimage, objects=skeleton | skeleton=objects)
+
+		CalcWidthLength(objects=skeleton | skeleton=objects)
+	Else()
+		skeleton.dendrite_maxwidth=vec(0);
+		skeleton.dendrite_meanwidth=vec(0);
+		skeleton.dendrite_medianwidth=vec(0);
+		skeleton.dendrite_minwidth=vec(0);
+		skeleton.skeleton_node_count=vec(0);
+	End()
+	
+	
+}	
+
+proc searchRegion(
+	objectList neurites in "neurites",
+	objectList nuclei in "nuclei",
+	integer dilationPx in "dilation",
+	double minAreaPx in "minAreaPx",
+	objectList neurites out "neurites",)
+	{
+		CalcErosion(ErosionDistance=dilationPx, Stencil=body, Objects=neurites | neurites = Objects)
+		neurites.searchRegion = neurites.eroded; 
+		CalcErosion(ErosionDistance=2*dilationPx, Stencil=body, Objects=nuclei | nuclei = Objects)
+		Not(image=nuclei.eroded.@array | image)
+		Mul(x=Image, y=neurites.searchRegion.@array, result_type="y_type" | result)
+		Mask(threshold=1,image=result | mask)
+		Mask2Stencil(mask=mask, Method="One large object"| stencil)
+		neurites.searchRegion=stencil;
+		
+}
+
+proc searchRegion1Spot(
+	objectList neurites in "neurites",
+	objectList nuclei in "nuclei",
+	image img1 in "image1",
+	integer dilationPx in "dilation",
+	double minAreaPx in "minAreaPx",
+	objectList neurites out "neurites",)
+	{
+		CalcErosion(ErosionDistance=dilationPx, Stencil=body, Objects=neurites | neurites = Objects)
+		neurites.searchRegion = neurites.eroded; 
+		Delete(neurites.eroded)
+		//Exclude staining artefacts
+		CalcIntensity(Stencil=neurites.body, image=img1, AttributeName="intImg1", CalcStdDev=true, Objects=neurites | neurites=objects)
+		threshArtefact=neurites.intImg1.@mean + 20*neurites.intImg1_stddev.@mean;
+		Mask(threshold=threshArtefact, image=img1 | mask)
+		Mask2Stencil(mask=mask| stencil=stencil)
+		Stencil2Objects(Stencil=stencil | objects=objects)
+		if(Objects.@count>0)
+			ObjectFilter("Area>"&minAreaPx,  Objects=objects | Objects = objects)
+			if(Objects.@count>0)
+				CalcErosion(ErosionDistance=dilationPx, Stencil=body, Objects=objects| Objects = objects)
+				Not(image=objects.eroded.@array | image)
+				Mul(x=Image, y=neurites.searchRegion.@array, result_type="y_type" | result)
+				Mask(threshold=1,image=result | mask)
+				Mask2Stencil(mask=mask, Method="One large object"| stencil)
+				neurites.searchRegion=stencil;
+			End()
+		End()
+		Delete(neurites.intImg1,neurites.intImg1_stddev)
+		
+		CalcErosion(ErosionDistance=2*dilationPx, Stencil=body, Objects=nuclei | nuclei = Objects)
+		Not(image=nuclei.eroded.@array | image)
+		Mul(x=Image, y=neurites.searchRegion.@array, result_type="y_type" | result)
+		Mask(threshold=1,image=result | mask)
+		Mask2Stencil(mask=mask, Method="One large object"| stencil)
+		neurites.searchRegion=stencil;
+		
+	}
+	
+proc searchRegion2Spot(
+	objectList neurites in "neurites",
+	objectList nuclei in "nuclei",
+	image img1 in "image1",
+	image img2 in "image2",
+	integer dilationPx in "dilation",
+	double minAreaPx in "minAreaPx",
+	objectList neurites out "neurites",)
+	{
+		CalcErosion(ErosionDistance=dilationPx, Stencil=body, Objects=neurites | neurites = Objects)
+		neurites.searchRegion = neurites.eroded; 
+		Delete(neurites.eroded)
+		//Exclude staining artefacts
+		CalcIntensity(Stencil=neurites.body, image=img1, AttributeName="intImg1", CalcStdDev=true, Objects=neurites | neurites=objects)
+		threshArtefact=neurites.intImg1.@mean + 20*neurites.intImg1_stddev.@mean;
+		Mask(threshold=threshArtefact, image=img1 | mask)
+		Mask2Stencil(mask=mask| stencil=stencil)
+		Stencil2Objects(Stencil=stencil | objects=objects)
+		if(Objects.@count>0)
+			ObjectFilter("Area>"&minAreaPx,  Objects=objects | Objects = objects)
+			if(Objects.@count>0)
+				CalcErosion(ErosionDistance=dilationPx, Stencil=body, Objects=objects| Objects = objects)
+				Not(image=objects.eroded.@array | image)
+				Mul(x=Image, y=neurites.searchRegion.@array, result_type="y_type" | result)
+				Mask(threshold=1,image=result | mask)
+				Mask2Stencil(mask=mask, Method="One large object"| stencil)
+				neurites.searchRegion=stencil;
+			End()
+		End()
+		Delete(neurites.intImg1,neurites.intImg1_stddev)
+		
+		//threshArtefact=img2.@mean+20*img2.@stddev;
+		CalcIntensity(Stencil=neurites.body, image=img2, AttributeName="intImg2", CalcStdDev=true, Objects=neurites | neurites=objects)
+		threshArtefact=neurites.intImg2.@mean + 20*neurites.intImg2_stddev.@mean;
+		Mask(threshold=threshArtefact, image=img2 | mask)
+		Mask2Stencil(mask=mask| stencil=stencil)
+		Stencil2Objects(Stencil=stencil | objects=objects)
+		if(Objects.@count>0)
+			//Filter > 5microns^2
+			ObjectFilter("Area>"&minAreaPx,  Objects=objects | Objects = objects)
+			if(Objects.@count>0)
+				CalcErosion(ErosionDistance=dilationPx, Stencil=body, Objects=objects| Objects = objects)
+				Not(image=objects.eroded.@array | image)
+				Mul(x=Image, y=neurites.searchRegion.@array, result_type="y_type" | result)
+				Mask(threshold=1,image=result | mask)
+				Mask2Stencil(mask=mask, Method="One large object"| stencil)
+				neurites.searchRegion=stencil;
+			End()
+		End()
+		Delete(neurites.intImg2,neurites.intImg2_stddev)
+		
+		CalcErosion(ErosionDistance=2*dilationPx, Stencil=body, Objects=nuclei | nuclei = Objects)
+		Not(image=nuclei.eroded.@array | image)
+		Mul(x=Image, y=neurites.searchRegion.@array, result_type="y_type" | result)
+		Mask(threshold=1,image=result | mask)
+		Mask2Stencil(mask=mask, Method="One large object"| stencil)
+		neurites.searchRegion=stencil;
+		
+	}
+	
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// STOP PROCEDURES NEURITES
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// START PROCEDURES SYNAPSES
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	proc pearsonCorr(
+	Image ch1 in "Channel 1 image",
+	Image ch2 in "Channel 2 image",
+	stencil restrictiveStencil in "Restricted stencil",
+	double pearsonCorr out "Pearson Correlation",
+	image pearsonMap out "The Pearson's colocalization map",)	
+{
+	Stencil2Objects(Stencil=restrictiveStencil| Objects = objects)
+	CalcStat("mean",Image=ch1, Stencil=restrictiveStencil, AttrName="mean1", Objects = objects | Objects = objects)
+	CalcStat("mean",Image=ch2, Stencil=restrictiveStencil, AttrName="mean2", Objects = objects | Objects = objects)
+
+	Blank(ch1.Width, ch1.Height, 0.0 | image )
+	Convelems(image, "float", sign="signed" | result)
+	Carryobjects(Stencil=restrictiveStencil, Data = objects.mean1, image=result | ch1Mean=image)
+	Minus(x=ch1, y=ch1Mean, result_type="y_type" | result)
+	Mul(x=result, y=restrictiveStencil.mask.image, result_type="automatic"| ch1Offset=result)
+
+	Blank(ch2.Width, ch2.Height, 0.0 | image)
+	Convelems(image, "float", sign="signed" | result)
+	Carryobjects(Stencil=restrictiveStencil, Data=objects.mean2, image=result | ch2Mean=image)
+	Minus(x=ch2, y=ch2mean, result_type="y_type" | result)
+	Mul(x=result, y=restrictiveStencil.mask.image, result_type="automatic"| ch2Offset=result)
+	
+	Mul(x=ch1Offset, y=ch2Offset, result_type="y_type"| crossTerm=result)
+	pearsonNum= crossTerm.@sum;
+	Mul(x=ch1Offset, y=ch1Offset, result_type="y_type"| ch1Sq=result)
+	ch1SumSq = ch1Sq.@sum;
+	Mul(x=ch2Offset, y=ch2Offset, result_type="y_type"| ch2Sq=result)
+	ch2SumSq = ch2Sq.@sum;
+	pearsonDen = sqrt(ch1SumSq*ch2SumSq);
+	pearsonCorr=pearsonNum/pearsonDen;
+
+	// Calculating the Pearson colocalization Map
+	Objects.pearsonDen=filledvec(objects.@count,pearsonDen);
+	CalcAttr(Attrname="MapDenom", Formula="1 / pearsonDen", Objects=objects | Objects = objects )
+	Blank(ch1.Width, ch1.Height, 0.0 | image)
+	Convelems(image, "float", sign="signed" | result)
+	Carryobjects(restrictiveStencil, objects.MapDenom, image=result | image)
+	Mul(crossTerm,image | pearsonMap = result)
+}
+
+proc spotDetection(
+	image img in "image",
+	string method in "method",
+	double spotDistance in "spotDistance",
+	int iterations in "iteration",
+	double scale in "scale",
+	boolean autoThreshold in "autoThreshold",
+	double threshold in "threshold",
+	mask searchRegion in "searchRegion",
+	objectList objects out "Detected spots",
+	//image spotEnhanc out "Image Spot",	
+)
+{
+	//SER
+	images=vec(img);
+	EVT_Helper_CalculateTextureImage(scale,type="spot",images=images)
+	SER=images[0];
+	
+	//DOG
+	scaleLarge=1.6*scale;
+	scaleSmall=1*scale;
+	Texture::Gaussian1st2ndDerivFilter(image=img, scale=scaleLarge | gauss1 = L0)
+	Texture::Gaussian1st2ndDerivFilter(image=img, scale=scaleSmall | gauss2 = L0)
+	Minus(x=gauss1, y=gauss2, result_type="y_type"  | DoG = result)	
+	Delete(gauss1,gauss2)
+	
+	//SpotDetection
+	if(method=="SER")
+		spotEnhance=SER;
+		if(autoThreshold)
+			ThresholdXX(Image=SER)
+		End()
+		Mask(threshold=threshold,image=SER| mask)
+	Else()
+		spotEnhance=DOG;
+		if(autothreshold)
+			ConvElems(item=DoG,shiftnegative=true)
+			Inverse(image=result | DoGInvert=image)
+			ThresholdXX(Image=DoGInvert)	
+			Mask(threshold=threshold,image=DoGInvert | mask)
+		Else()
+			Mask(threshold=-threshold,image=DoG | mask)
+			Mul(x=mask.@Array, y=-1, result_type="y_type"  | result )
+			Mask(threshold=0, image= result| mask)
+		End()
+	End()	
+	Mul(x=searchRegion.@array, y=mask.@array, result_type="y_type" | maskSpot=result)
+	Mask2Stencil(Mask=maskSpot| stencilSpot=stencil)
+	Maximums(Distance=spotDistance, Method="MaximumInRange", Image=spotEnhance, Mask=maskSpot | maximums )
+	ObjectsFromCenters(Centers=maximums, RestrictiveStencil=stencilSpot, CentersType="Maximums", Image = img| Objects)
+	ObjectFilter("Area>"&3,  Objects=objects | objectsBefore=objects)
+	
+	objectsAfter=objectsBefore;
+	foreach(0..iterations,"a")
+		calczone(NumberOfOuterZones=1,zonetype="equidistant",objects=objectsAfter | objects=objects)
+		zonemask(filt_low=0,filt_high=-1,objects=objects | objects=objects)
+		objects.thres=filledvec(objects.@count,threshold);
+		if(method=="SER")
+			enhancedImage=SER;
+		else()
+			if(autoThreshold)
+				enhancedImage=DOGInvert;
+			Else()
+				enhancedImage=DOG;
+			End()
+		End()
+		CalcThreshmask(Stencil=zonemask,Threshold=thres,objects=objects,image=enhancedImage | objects=objects)
+		CarryPixels(mask=objects.threshmask.mask,data=objects.threshmask.image,Image=objects.body.image | result=image)
+		Stencil::CreateFromArray(array=result,ObjectCount=result.max | result=stencil)
+		Stencil2Objects(stencil=result | objects=objects)
+		// Shrink cells mask by 1 (no single pixel noses)
+		calczone(NumberOfOuterZones=0,zonetype="equidistant")
+		zonemask(filt_low=oo,filt_high=1,autorecalc=no,objects=objects | objects=objects)
+		stencil2objects(objects.zonemask| objects=objects)
+		// Extend objects mask by 1
+		calczone(NumberOfOuterZones=1,zonetype="equidistant")
+		zonemask(filt_low=oo,filt_high=-1,autorecalc=no,objects=objects | objects=objects)
+		stencil2objects(objects.zonemask| objectsAfter=objects)
+	end()
+	
+	objects=objectsAfter;
+	
+}	
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// STOP PROCEDURES SYNAPSES
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// START PROCEDURES GENERAL
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+proc selectWorkflow(
+	table sourcedata inout "processed sourcedata table",
+	table fieldtable=tbl() inout "processed field table",
+	table welltable=tbl() inout "processed well table",
+	container WellResults out,
+	string IN_FolderResultOutput out,
+)
+{
+	input("IN_Workflow_Assay", "Connectivity", "Assay: Workflow Settings", "s", "Select assay. Allowed values: \"Connectivity\".")
+	input("IN_Workflow_SelectChannel1", "Nuclei", "Select channel 1: Workflow Settings", "s", "Select channel 1. Allowed values: \"Nuclei\",\"Neurites\",\"Spot1\",\"Spot2\",\"X1\",\"-\".")
+	input("IN_Workflow_SelectChannel2", "Neurites", "Select channel 2: Workflow Settings", "s", "Select channel 1. Allowed values: \"Nuclei\",\"Neurites\",\"Spot1\",\"Spot2\",\"X2\",\"-\".")
+	input("IN_Workflow_SelectChannel3", "Spot1", "Select channel 3: Workflow Settings", "s", "Select channel 1. Allowed values: \"Nuclei\",\"Neurites\",\"Spot1\",\"Spot2\",\"X3\",\"-\".")
+	input("IN_Workflow_SelectChannel4", "Spot2", "Select channel 4: Workflow Settings", "s", "Select channel 1. Allowed values: \"Nuclei\",\"Neurites\",\"Spot1\",\"Spot2\",\"X4\",\"-\".")
+	input("IN_Workflow_FlatfieldCorrection",false,"Flatfield background correction: Workflow Settings",type="y",description="Implement flatfield background correction")
+	input("IN_Workflow_Visualization",true,"Generate visualizations: Workflow Settings",type="y",description="Generate visualizations during script execution. This might slow down the evaluation speed")
+	input("IN_Workflow_SaveVisualization",true,"Save visualizations: Workflow Settings",type="y",description="Generate detection visualizations during script execution. This might slow down the evaluation speed")
+	input("IN_Workflow_SaveResults",true,"Save results: Workflow Settings",type="y",description="Allow writing to disk.")
+	input("IN_FolderResultOutput","T:/Data","Folder results: Workflow Settings",type="p",description="Path for storing data/results locally. Files will be generated only if write to disk is allowed.")
+	input("IN_Workflow_WellRowList","0","Rows to be analyzed: Workflow Settings",type="literal",description="List of plate rows that should be evaluated (0 corresponds to all well rows). Comma separated lists as well as ranges are allowed (e.g. 1,2,5-10,11 or A-F,G,H) but no double character rows (e.g. AB-AF)")
+	input("IN_Workflow_WellColumnList","0","Columns to be analyzed: Workflow Settings",type="literal",description="List of plate columns that should be evaluated (0 corresponds to all well columns). Comma separated lists as well as ranges are allowed (e.g. 1,2,5-10,11)")
+	input("IN_Workflow_FieldList","0","Fields to be analyzed: Workflow Settings",type="literal",description="List of fields that should be evaluated  (0 corresponds to all fields). Comma separated lists as well as ranges are allowed (e.g. 1,2,5-10,11)")
+	pack(InPara,"IN_*")
+	EVT_WellProcessing_SelectWorkflow(fieldtable=fieldtable, welltable=welltable, sourcedata=sourcedata, InPara=InPara)	
+}
+	
+proc collectWellResults(
+	string variable in,
+	vector vec in,
+	container wellResults inout,
+)
+{
+	if(!defined("WellResults." & variable))
+		eval("set(WellResults." & variable & "=vec())")
+	end()
+	Append(WellResults.[variable],vec)
+}
+
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// STOP PROCEDURES GENERAL
+//-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#begin:attachment(encoding="text",name="",action="execute/acapella",type="parameters")
+provideinput("Assay: Workflow Settings", "Connectivity", ver=2)
+provideinput("Select channel 1: Workflow Settings", "Nuclei", ver=2)
+provideinput("Select channel 2: Workflow Settings", "Neurites", ver=2)
+provideinput("Select channel 3: Workflow Settings", "Spot2", ver=2)
+provideinput("Select channel 4: Workflow Settings", "Spot1", ver=2)
+provideinput("Flatfield background correction: Workflow Settings", "0", ver=2)
+provideinput("Generate visualizations: Workflow Settings", "1", ver=2)
+provideinput("Save visualizations: Workflow Settings", "1", ver=2)
+provideinput("Save results: Workflow Settings", "1", ver=2)
+provideinput("Folder results: Workflow Settings", "C:/Users/mVerschuuren/Desktop/Test Output NeuroConnectivity", ver=2)
+provideinput("Rows to be analyzed: Workflow Settings", "0", ver=2)
+provideinput("Columns to be analyzed: Workflow Settings", "0", ver=2)
+provideinput("Fields to be analyzed: Workflow Settings", "3", ver=2)
+provideinput("Manual threshold: Nuclei", "200", ver=2)
+provideinput("Lower cutoff area (µm^2): Nuclei", "30", ver=2)
+provideinput("Split factor nuclei: Nuclei", "0.95", ver=2)
+provideinput("Classification -- Cutoff roundness: Nuclei", "1.05", ver=2)
+provideinput("Classification -- Cutoff area (µm^2) : Nuclei", "140", ver=2)
+provideinput("Classification -- Min % of  border within mask neurites : Nuclei", "50", ver=2)
+provideinput("Cluster analysis -- Run: Nuclei", "1", ver=2)
+provideinput("Cluster analysis -- Max distance (µm) : Nuclei", "5", ver=2)
+provideinput("Dilation nuclei (µm) to create search region: Neurites", "0.75", ver=2)
+provideinput("Rough --  Scale gaussian blur: Neurites", "5", ver=2)
+provideinput("Rough -- Threshold: Neurites", "1100", ver=2)
+provideinput("Detail -- Minimal scale for enhancement: Neurites", "2", ver=2)
+provideinput("Detail -- Step scale for enhancement : Neurites", "5", ver=2)
+provideinput("Detail -- Number of scale steps for enhancement: Neurites", "3", ver=2)
+provideinput("Detail -- Threshold after enhancement: Neurites", "0.1", ver=2)
+provideinput("Max projection spot channels: Synapses", "0", ver=2)
+provideinput("Method for spot detection: Synapses", "DOG", ver=2)
+provideinput("Spot Analysis 1: Synapses", "1", ver=2)
+provideinput("Spot Analysis 2: Synapses", "1", ver=2)
+provideinput("Auto threshold: Synapses", "0", ver=2)
+provideinput("Manual threshold spot 1: Synapses", "30", ver=2)
+provideinput("Manual threshold spot 2: Synapses", "30", ver=2)
+provideinput("Scale spot 1: Synapses", "1", ver=2)
+provideinput("Scale spot 2: Synapses", "1", ver=2)
+
+#end:attachment

@@ -1,0 +1,999 @@
+//**************************************************************************
+// Neuronal Connectivity Analysis
+//-------------------------------------------------------------------------------------
+// Template: ©2012-2014 Evotec AG, Hamburg. All Rights Reserved.
+//***************************************************************************
+
+proc EVT_WellProcessing_SelectWorkflow(
+	Container InPara in "packed input parameters",
+	table sourcedata inout "processed sourcedata table",
+	table fieldtable=tbl() inout "processed field table",
+	table welltable=tbl() inout "processed well table",
+	container WellResults out,
+	string IN_FolderResultOutput out,
+)
+[experimental] Evotec Library "Select basic workflow settings and create wellresults container. Interpret and assign channel information by name."
+{
+	dbg::Log(5,"EVT","Well Processing","Select Workflow Items")
+	Unpack(InPara)
+		
+	set(EVT_Workflow=iif(IN_Workflow_Visualization,"Visualization",""))
+	set(EVT_Workflow=EVT_Workflow & iif(IN_Workflow_FlatfieldCorrection,"FlatfieldCorrection",""))
+	set(EVT_Workflow=EVT_Workflow & iif(IN_Workflow_SaveVisualization,"SaveImages",""))
+	set(EVT_Workflow=EVT_Workflow & iif(IN_Workflow_SaveResults,"SaveResults",""))
+		
+	if(IN_Workflow_Assay == "Connectivity")
+		set(EVT_Workflow=EVT_Workflow &"AssayConnectivity")
+	Elif(IN_Workflow_Assay == "pAMPA")
+		set(EVT_Workflow=EVT_Workflow & "AssaypAMPA")
+	Else()
+		set(EVT_Workflow=EVT_Workflow & "AssayTAU")
+	End()
+	
+	SetSys(EVT_Workflow=EVT_Workflow)
+
+	// Create a container for collecting well results.
+	Columbus::WellNumber2Str(sourcedata.row[0],sourcedata.column[0])
+	EVT_Helper_CreateUID(vec(sourcedata.Platename[0]&sourcedata.MeasurementDate[0]&wellstr))
+	set(WellUID=uids[0])
+	set(WellResults=cnt(
+		_HIDDEN_WellErrors="",
+		_RAW_PlateName=sourcedata.Platename[0],
+		_RAW_MeasurementDate=sourcedata.MeasurementDate[0],
+		_RAW_WellName=wellstr,
+		_RAW_WellColumn=sourcedata.Column[0],
+		_RAW_WellRow=sourcedata.Row[0],
+		_RAW_WellUID=WellUID,
+		_RAW_ProcessingTime=__systemtime__
+	))
+	
+	//Collect inputParameters
+	pack(InPara,"IN_*")
+	EVT_Helper_CollectInputs(InPara=InPara, WellResults=WellResults | WellResults )
+	delete(InPara)
+	
+	//Create string with rows/columns to analyse, if row or column not in list --> "Not in...."
+	tabulate("65+x",26)
+	SprintfVector(ABCZ,"%c",int(result))
+	foreach(range(0,ABCZ.length),"i")
+		set(IN_Workflow_WellRowList=rep(IN_Workflow_WellRowList,ABCZ[i],"" & i+1))
+	end()
+	EVT_ParseRangeInput(IN_Workflow_WellRowList | rangelist )
+	if(rangelist.min!=0)
+		FindElem(sourcedata.row[0],rangelist)
+		if(pos<0)
+			set(WellResults._HIDDEN_WellErrors=WellResults._HIDDEN_WellErrors & "Not in selected Row ")
+		end()
+	end()
+	EVT_ParseRangeInput(IN_Workflow_WellColumnList)
+	if(rangelist.min!=0)
+		FindElem(sourcedata.column[0],rangelist)
+		if(pos<0)
+			set(WellResults._HIDDEN_WellErrors=WellResults._HIDDEN_WellErrors & "Not in selected Column ")
+		end()
+	end()
+	
+	//Assign Channels
+	set(Channels=sort(uniq(sourcedata.channel).result).result)
+	set(Channelnames=vec())
+	
+	//Read in channel names
+	If(IN_Workflow_SelectChannel1!="-")
+		Push(Channelnames,IN_Workflow_SelectChannel1)
+	End()
+	FindElem(item=IN_Workflow_SelectChannel2,vector=channelNames  | pos)
+	If(pos==-1)
+		if(IN_Workflow_SelectChannel2!="-")
+			Push(Channelnames,IN_Workflow_SelectChannel2)
+		End()
+	else()
+		Error("Duplicate channel name")
+	End()
+	FindElem(item=IN_Workflow_SelectChannel3,vector=channelNames  | pos)
+	If(pos==-1)
+		If(IN_Workflow_SelectChannel3!="-")
+			Push(Channelnames,IN_Workflow_SelectChannel3)
+		End()
+	else()
+		Error("Duplicate channel name")
+	End()
+	FindElem(item=IN_Workflow_SelectChannel4,vector=channelNames  | pos)
+	If(pos==-1)
+		If(IN_Workflow_SelectChannel4!="-")
+			Push(Channelnames,IN_Workflow_SelectChannel4)
+		End()
+	else()
+		Error("Duplicate channel name")
+	End()
+	
+	//if(length(IN_Workflow_SelectChannels)>0)
+		//set(ChannelNames=splitstring(IN_Workflow_SelectChannels,separators="-",trim=true).split)
+	//else()
+		//Error("Sequence channels not defined")
+	//End()
+	//set(ChannelNames=rep(trim(ChannelNames)," ","_"))
+
+	if(Channelnames.length!=Channels.length)
+		error("Number of named channels do not match acquired image data")
+	end()
+
+	//Create channelTable
+	set(ChannelTable=tbl(Channel=channels,ChannelName=ChannelNames))
+	set(ChannelTable.ChannelNameOriginal=filledvec(ChannelTable.@rowcount,""))
+	set(ChannelTable.MainExcitationWavelength@nm=filledvec(ChannelTable.@rowcount,0))
+	set(ChannelTable.MainEmissionWavelength@nm=filledvec(ChannelTable.@rowcount,0))
+	set(channellabel="")
+	Foreach(range(0,ChannelTable.@rowcount),"c")
+		//Include index in Wellresults
+		set(_["Wellresults._HIDDEN_Channel_" &  ChannelTable.Channelname[c]]=ChannelTable.Channel[c])
+		FindElem(ChannelTable.Channel[c],sourcedata.Channel)
+		if(pos>-1)
+			set(ChannelTable.ChannelNameOriginal[c]=eval("sourcedata.Channelname[pos]",""))
+			set(ChannelTable.MainExcitationWavelength@nm[c]=eval("sourcedata.MainExcitationWavelength@nm[pos]",0))
+			set(ChannelTable.MainEmissionWavelength@nm[c]=eval("sourcedata.MainEmissionWavelength@nm[pos]",0))
+		end()
+		sprintf(clabel,"%s (%d_%s) [%d_%dnm]",ChannelTable.ChannelName[c],ChannelTable.Channel[c],ChannelTable.ChannelNameOriginal[c],ChannelTable.MainExcitationWavelength@nm[c],ChannelTable.MainEmissionWavelength@nm[c])
+		set(channellabel=channellabel & "\n" & clabel)
+	end()
+	set(WellResults._RAW_ProcessingChannelLabel=rep(trim(channellabel),"\n","- "))
+	set(WellResults._HIDDEN_ChannelTable=ChannelTable)
+	
+	if(fieldtable.@rowcount<1)
+		EVT_WellProcessing_CreateWellFieldTableBySourcedata(sourcedata=sourcedata,fieldtable=fieldtable,welltable=welltable)
+	end()
+
+	set(FieldTable.FieldResults=filledvec(FieldTable.@rowcount,cnt()))
+	set(IN_Workflow_FieldList=eval("IN_Workflow_FieldList","0"))
+	set(welltable.EVT_Fields_Local=filledvec(welltable.@rowcount,IN_Workflow_FieldList))
+	
+	EVT_WellProcessing_UpdateWellresultsByWelltable(sourcedata=sourcedata,fieldtable=fieldtable,welltable=welltable,Wellresults=Wellresults)
+}
+proc EVT_Helper_CollectInputs(
+container InPara in "full datablock",
+container WellResults=cnt() inout "processed Well result container"
+)
+[experimental] Evotec Library "Collect inputs according to naming convention IN_ and populate WellResults with used content. Should be located after an input section inside each procedure"
+{
+	
+	foreach(range(0,InPara.@length),"i")
+		set(k="_RAW_" & InPara.@keys[i])
+		set(_["WellResults." & k]=InPara.@values[i])
+	end()
+}
+
+proc EVT_ParseRangeInput(
+	string rangeinputtext="" in,
+	vector rangelist=vec() out
+)
+[experimental] Evotec Library "Special range definition interpretation"
+{
+	set(rangelist=vec())
+	while(at("  ",rangeinputtext))
+		set(rangeinputtext=rep(rangeinputtext,"  "," "))
+	end()
+	while(at("--",rangeinputtext))
+		set(rangeinputtext=rep(rangeinputtext,"--","-"))
+	end()
+
+	set(rangeinputtext=rep(rangeinputtext,"- ","-"))
+	set(rangeinputtext=rep(rangeinputtext," -","-"))
+	set(rangeinputtext=rep(rangeinputtext,";",","))
+	set(rangeinputtext=rep(rangeinputtext,"-,",","))
+	set(rangeinputtext=rep(rangeinputtext,",-",","))
+	set(rangeinputtext=rep(rangeinputtext," ",","))
+	while(at(",,",rangeinputtext))
+		set(rangeinputtext=rep(rangeinputtext,",,",","))
+	end()
+	splitstring(rangeinputtext,separators=",")
+	foreach(split,"s")
+		if(length(s)>0)
+			Regex(s,"(\\d*)-(\\d*)")
+			if(matches.length>0)
+				set(min=vec(int(matches[0]),int(matches[1])).min)
+				set(max=vec(int(matches[0]),int(matches[1])).max)
+				tabulate("min+x",max-min+1)
+				append(rangelist,int(result))
+			else()
+				Regex(s,"(\\d*)")
+				if(matches.length>0)
+					append(rangelist,int(matches[0]))
+				else()
+					error("EVT: Unknown range section format:" & s)
+				end()
+			end()
+		end()
+	end()
+
+	set(rangelist=uniq(rangelist).result)
+	set(rangelist=sort(rangelist).result)
+}
+
+proc EVT_WellProcessing_UpdateWellresultsByWelltable(
+	table sourcedata=tbl() inout "processed image table",
+	table fieldtable=tbl() inout "processed field table",
+	table welltable=tbl() inout "processed well table",
+	container WellResults=cnt() inout "processed Well result container",
+)
+[experimental] Evotec Library "Update Wellresults by region/field and other well table information"
+{
+		
+	set(sourcedata_full=sourcedata)
+	set(fieldtable_full=fieldtable)
+	set(welltable_full=welltable)
+	
+	set(WellUIDs=uniq(welltable.WellUID).result)
+	set(WellResults._HIDDEN_WellErrors=eval("WellResults._HIDDEN_WellErrors",""))
+
+	set(sourcedata_new=tbl())
+	set(fieldtable_new=tbl())
+	set(welltable_new=tbl())	
+	
+	foreach(WellUIDs,"w")
+		TableFilter("WellUID==\"" & w & "\"",table=sourcedata_full | sourcedata=table)
+		TableFilter("WellUID==\"" & w & "\"",table=fieldtable_full | fieldtable=table)
+		TableFilter("WellUID==\"" & w & "\"",table=welltable_full | welltable=table)
+		
+		// First parse well table for simple data types
+		foreach(range(0,welltable.@columncount),"c")
+			set(name=welltable.@columns[c])
+			set(wellvalue=trim(_["welltable." & name & "[0]"]))
+			if(at("EVT_AnalysisType",Name))
+				set(FieldTable.AnalysisType=filledvec(FieldTable.@rowcount,wellvalue))
+				set(WellResults._RAW_AnalysisType=wellvalue)
+			elif(at("EVT_WellErrors",Name))
+				set(WellResults._HIDDEN_WellErrors=WellResults._HIDDEN_WellErrors & wellvalue)
+			elif(at("EVT_Channel",Name))
+				set(IN_SelectChannels=wellvalue)
+				if(length(IN_SelectChannels)>0)
+					set(ChannelNames=splitstring(IN_SelectChannels,separators=",;",trim=true).split)
+					set(ChannelNames=rep(trim(ChannelNames)," ","_"))
+					if(Channelnames.length!=WellResults._HIDDEN_ChannelTable.@rowcount)
+						error("Number of named channels in Assaydefinition do not match acquired image data")
+					end()
+					set(WellResults._HIDDEN_ChannelTable.ChannelName=ChannelNames)
+					Foreach(range(0,WellResults._HIDDEN_ChannelTable.@rowcount),"c")
+						set(_["Wellresults._HIDDEN_Channel_" &  WellResults._HIDDEN_ChannelTable.Channelname[c]]=WellResults._HIDDEN_ChannelTable.Channel[c])
+					end()
+				end()
+			elif(at("EVT_",Name))
+				EVT_GetKeywords("Well")
+				FindElem(Name,"EVT_" & keywords)
+				if(pos>=0)
+					set(newname="_RAW_" & rep(Name,"EVT_",""))
+					set(_["WellResults." & newname]=wellvalue)
+				end()
+			end()
+		end()
+
+		// Second parse for field/region specific information
+		foreach(range(0,WellTable.@columncount),"c")
+			set(columnname=WellTable.@columns[c])
+			set(columnvalue=eval("WellTable." & columnname & "[0]",""))
+			if(at("EVT_Fields_",WellTable.@columns[c]) or at("EVT_FieldErrors",WellTable.@columns[c]))
+				set(Name=rep(columnname,"EVT_Fields_",""))
+				set(Name=rep(Name,"EVT_",""))
+				set(Name=rep(Name," ",""))
+				set(Name=Columbus::ValidFilenamePart(Name).filename)
+				if(length(columnvalue) and length(Name))		
+					EVT_ParseRangeInput(columnvalue)
+					if(rangelist.min==0)
+						set(result=fieldtable.valid)
+					else()
+						translate(fieldtable.field,rangelist,filledvec(rangelist.length,1),defaultvalue=0)
+						set(result=result and fieldtable.valid)
+					end()	
+				end()
+			end()
+		end()
+		
+		set(fieldtable.valid=fieldtable.valid and (result>0))
+		
+		//Exclude fields with acquisition malfunction
+		set(skipWell=(length(eval("WellResults._HIDDEN_WellErrors",""))>0) or (FieldTable.Valid.sum==0))
+		if(!skipWell)
+			WellResults._RAW_IndexInvalidFields="-";
+			Foreach(range(0,result.@count),"f")
+				if(result[f]==1)
+					TableFilter("Field==" & FieldTable.Field[f],table=sourcedata | imagetable=table)
+					Foreach(range(0,imagetable.@rowcount),"i")
+						if (eval("imagetable.sourceimage[i].@sticky.noimage",0)==1) 
+							result[f]=0;
+							fieldtable.valid[f]=0;
+							WellResults._RAW_IndexInvalidFields=(WellResults._RAW_IndexInvalidFields & f+1 & "-");
+						End()
+					End()
+				End()
+			End()
+		End()
+
+		set(fieldtable.selected=fieldtable.valid)
+		translate(fieldtable.wellname,welltable.wellname,welltable.valid)
+		set(sourcedata_new.@appendrow=sourcedata)
+		set(fieldtable_new.@appendrow=fieldtable)
+		set(welltable_new.@appendrow=welltable)
+	end()
+
+	set(sourcedata=sourcedata_new)
+	set(fieldtable=fieldtable_new)
+	set(welltable=welltable_new)	
+	
+	if(welltable_new.@rowcount>1)
+		set(WellResults=cnt())
+	end()
+}
+
+proc EVT_GetKeywords(
+	string group="All" in "Allowed values: All,Well,Image",
+	vector keywords out
+)	
+[experimental] Evotec Library "Collection of keywords"
+{	
+	set(keywords=vec())
+	if(group=="Well" or group=="All")
+		append(keywords,vec("ScreenName","PlateName","MeasurementDate","WellName","Control","Comment","AnalysisType"
+			"AnimalID","SampleID","Staining","SampleType","Age","Density","Gender","Genotype","Cohort",
+			"Treatment","Compound","Compound_Name","Compound_Concentration","Position","valid","selected"))
+	end()
+	if(group=="Image" or group=="All")	
+		append(keywords,vec("WellName","Timepoint","Plane","Field","Channel","Row","Column",
+			"AcquisitionType","InstrumentType","PlateType","PlateColumns","PlateRows",
+			"ChannelName","ChannelColor","ChannelType",
+			"ImageSizeX","ImageSizeY","ImageSizeZ",
+			"MeasurementTimeOffset@s","AbsoluteTime@s","TimeOffset@s",
+			"ImageResolutionX@um","ImageResolutionY@um","ImageResolutionZ@um","OrientationMatrix",
+			"PositionX@um","PositionY@um","PositionZ@um","AbsolutePositionX@um","AbsolutePositionY@um","AbsolutePositionZ@um",
+			"MainEmissionWavelength@nm","MainExcitationWavelength@nm",
+			"valid","selected"))
+	end()
+	set(keywords=uniq(keywords).result)
+}
+
+proc EVT_WellProcessing_SingleWell(
+	table sourcedata=tbl() inout "processed sourcedata table",
+	table fieldtable=tbl() inout "processed field table",
+	table welltable=tbl() inout "processed well table",
+	boolean allowdelayedloading=true in,
+)
+[experimental] Evotec Library "Replaces singlewell call allowing to transfer sourcedata from environment (batch job processing)"
+{
+	dbg::Log(5,"TRIAD","Well Processing","SingleWell")
+
+	if(sourcedata.@rowcount<1)
+		SingleWell(compact=true)
+		// avoid confusion by double image entry. Use sourceimage
+		delete(sourcedata.image)
+	end()
+
+	EVT_WellProcessing_CreateWellFieldTableBySourcedata(sourcedata=sourcedata,fieldtable=fieldtable,welltable=welltable)
+
+	set(wellUID=eval("sourcedata.WellUID[0]",""))
+
+	Tablefilter("WellUID==\"" & wellUID & "\"",table=sourcedata | sourcedata=table)
+	Tablefilter("WellUID==\"" & wellUID & "\"",table=fieldtable | fieldtable=table)
+	Tablefilter("WellUID==\"" & wellUID & "\"",table=welltable | welltable=table)
+
+	if(!allowdelayedloading)
+		if(defined("sourcedata.sourceimage") and (__version__<27))
+			foreach(range(0,sourcedata.@rowcount),"i")
+				set(k=sourcedata.sourceimage[i].@virt:image)
+			end()
+		end()
+		EVT_WellProcessing_SingleWellDelayedImageLoading(sourcedata=sourcedata)
+	end()
+
+}
+
+proc EVT_WellProcessing_CreateWellFieldTableBySourcedata(
+	table sourcedata inout,
+	table fieldtable=tbl() inout "processed field table",
+	table welltable=tbl() inout "processed well table",
+)
+[experimental] Evotec Library "Create inital Welltable and Fielddata by Sourcedata content"
+{
+	if(sourcedata.@rowcount)
+		//Create WellName and FieldName
+		Columbus::WellNumber2Str(vectorize(sourcedata.Row),vectorize(sourcedata.Column))
+		set(sourcedata.WellName=wellstr)
+		set(sourcedata.FieldName=wellstr & "-" & sourcedata.Field)
+		
+		//Create well-ID
+		EVT_Helper_CreateUID(sourcedata.Platename&sourcedata.MeasurementDate&sourcedata.WellName)
+		set(sourcedata.WellUID=uids)
+		
+		//If there is no valid variable: set validity of all sourcedata TRUE=1
+		set(sourcedata.valid=eval("sourcedata.valid",filledvec(sourcedata.@rowcount,true)))
+		
+		//If ImageSizeX and ImageSizeY do not exist, set equal to imageWidth and ImageHeight
+		if(!defined("sourcedata.ImageSizeX") or !defined("sourcedata.ImageSizeY"))
+			set(sourcedata.ImageSizeX=sourcedata.ImageWidth)
+			set(sourcedata.ImageSizeY=sourcedata.ImageHeight)
+		end()
+		delete(sourcedata.ImageWidth,sourcedata.ImageHeight)
+		
+		//If there is no valid f, t, p or c data: set 1
+		set(sourcedata.Field=eval("sourcedata.Field",filledvec(sourcedata.@rowcount,1)))
+		set(sourcedata.Timepoint=eval("sourcedata.Timepoint",filledvec(sourcedata.@rowcount,1)))
+		set(sourcedata.Plane=eval("sourcedata.Plane",filledvec(sourcedata.@rowcount,1)))
+		set(sourcedata.Channel=eval("sourcedata.Channel",filledvec(sourcedata.@rowcount,1)))
+		
+		//If there is no valid calibration: set 0
+		set(sourcedata.PositionX@um=eval("sourcedata.PositionX@um",filledvec(sourcedata.@rowcount,0.0)))
+		set(sourcedata.PositionY@um=eval("sourcedata.PositionY@um",filledvec(sourcedata.@rowcount,0.0)))
+		set(sourcedata.PositionZ@um=eval("sourcedata.PositionZ@um",filledvec(sourcedata.@rowcount,0.0)))
+		
+		// If isFinite (no NA) = true: v=1x1x1=1; Else if calibration not known, set to 0
+		set(v=isfinite(sourcedata.PositionX@um)*isfinite(sourcedata.PositionY@um)*isfinite(sourcedata.PositionZ@um))
+		if(v.min<1)
+			foreach(range(0,sourcedata.@rowcount),"i")
+				set(sourcedata.PositionX@um[i]=iif(isfinite(sourcedata.PositionX@um[i]),sourcedata.PositionX@um[i],0.0))
+				set(sourcedata.PositionY@um[i]=iif(isfinite(sourcedata.PositionY@um[i]),sourcedata.PositionY@um[i],0.0))
+				set(sourcedata.PositionZ@um[i]=iif(isfinite(sourcedata.PositionZ@um[i]),sourcedata.PositionZ@um[i],0.0))
+			end()
+		end()
+		
+		// assumes that data is comming from one device with one orientationmatrix
+		if(defined("sourcedata.OrientationMatrix"))
+			set(matrix=img(vec(1,0,0),vec(0,1,0),vec(0,0,1)))
+			if(sourcedata.OrientationMatrix.@elemtype2=="string")
+				if(length(sourcedata.OrientationMatrix[0]))
+					str2Matrix(sourcedata.OrientationMatrix[0] | matrix=matrix)
+				end()
+			end()
+			if(sourcedata.OrientationMatrix.@elemtype2=="memblock")
+				set(matrix=sourcedata.OrientationMatrix[0])
+			end()
+			stat::Projection(matrix^2,"sum" | norms=sqrt(result))
+			set(matrix=matrix/norms)
+			
+			if(defined("sourcedata.ImageResolutionX@um") and defined("sourcedata.ImageResolutionY@um"))
+				set(sourcedata.ImageResolutionX@um=abs(sourcedata.ImageResolutionX@um*norms[0]))
+				set(sourcedata.ImageResolutionY@um=abs(sourcedata.ImageResolutionY@um*norms[1]))
+				set(sourcedata.PositionX@um=sourcedata.PositionX@um*matrix[0,0]+sourcedata.PositionY@um*matrix[1,0])
+				set(sourcedata.PositionY@um=sourcedata.PositionX@um*matrix[0,1]+sourcedata.PositionY@um*matrix[1,1])
+			end()
+			delete(sourcedata.OrientationMatrix)	
+		end()
+		
+		//Create FieldTable
+		if(FieldTable.@rowcount<1)
+			//ReOrder according to fieldName
+			uniq_prepare(sourcedata.FieldName | order)
+			set(fieldtable=tbl(fieldname=reorder(sourcedata.FieldName,order).result))
+			set(fieldtable.wellname=reorder(sourcedata.WellName,order).result)
+			set(fieldtable.Field=reorder(sourcedata.Field,order).result)
+			set(fieldtable.PositionX@um=reorder(sourcedata.PositionX@um,order).result)
+			set(fieldtable.PositionY@um=reorder(sourcedata.PositionY@um,order).result)
+		end()
+
+		//Add PlateName, MeasurementDate, Validity and ID
+		set(fieldtable.PlateName=eval("fieldtable.PlateName",filledvec(fieldtable.@rowcount,sourcedata.Platename[0])))
+		set(fieldtable.MeasurementDate=eval("fieldtable.MeasurementDate",filledvec(fieldtable.@rowcount,sourcedata.MeasurementDate[0])))
+		set(fieldtable.valid=eval("fieldtable.valid",filledvec(fieldtable.@rowcount,true)))
+		EVT_Helper_CreateUID(fieldtable.Platename&fieldtable.MeasurementDate&fieldtable.WellName)
+		set(fieldtable.WellUID=uids)
+
+		//Create WellTable analogous to FieldTable
+		if(WellTable.@rowcount<1)
+			set(wellname=sort(uniq(sourcedata.WellName).result).result)
+			set(welltable=tbl(WellName=wellname))
+		end()
+		set(welltable.PlateName=eval("welltable.PlateName",filledvec(welltable.@rowcount,sourcedata.Platename[0])))
+		set(welltable.MeasurementDate=eval("welltable.MeasurementDate",filledvec(welltable.@rowcount,sourcedata.MeasurementDate[0])))
+		set(welltable.valid=eval("welltable.valid",filledvec(welltable.@rowcount,true)))
+		EVT_Helper_CreateUID(welltable.Platename&welltable.MeasurementDate&welltable.WellName)
+		set(welltable.WellUID=uids)
+	end()
+}
+
+proc EVT_WellProcessing_SingleWellDelayedImageLoading(
+	table sourcedata=tbl() inout "processed sourcedata table",
+)
+[experimental] Evotec Library "Loads images based on possibly reduced index"
+{
+	dbg::Log(5,"EVT","Well Processing","SingleWell-DelayedImageLoading")
+
+	if(!defined("sourcedata.sourceimage"))
+		Columbus::ReadColumbusImageFilecontent(sourcedata=sourcedata)
+	end()
+}
+
+proc EVT_Helper_CreateUID(
+	vector names in,
+	vector uids out,
+)
+[experimental] Evotec Library "Create UIDs by md5"
+{
+	set(uids=vec())
+	set(a=sort(uniq(names).result).result)
+	if(a.length)
+		foreach(range(0,a.length),"i")
+			push(b,md5(a[i]))
+		end()
+		translate(names,a,b)
+		set(uids=result)
+	end()
+}
+
+proc EVT_ReduceImages_HarmonyFlatfieldCorrection(
+string method="Background" in "valid methods: Background, Foreground",
+table sourcedata inout "processed sourcedata table"
+)
+[experimental] Evotec Library "Harmony (Operetta/Opera Phenix) flatfield correction"
+{
+	GetSys(EVT_Workflow)
+	set(LimitMemory=at("LimitMemory",EVT_Workflow))
+	dbg::Log(5,"EVT","Reduce Images","Harmony Flatfield Correction")
+	
+	set(FlatfieldProfiles = eval("sourcedata.FlatfieldProfile", filledvec(sourcedata.@rowcount,"")))
+	set(ChannelType=eval("sourcedata.ChannelType",filledvec(sourcedata.@rowcount,"Fluorescence")))
+	
+	UniqTable(tbl(channel=sourcedata.channel, FlatFieldProfile=FlatFieldProfiles, ChannelType=ChannelType), "channel")
+	Flatfield::DecodeProfile(table.FlatfieldProfile, vNeedsCorrection=(ChannelType=="Fluorescence"), CacheTag="AAL::InputImage")
+	
+	Translate(sourcedata.channel,table.channel,FlatfieldProfiles)
+	FlatField::ApplyCorrection(parallel(sourcedata.sourceimage),parallel(result),mode=method)
+}
+
+proc EVT_FieldProcessing_CollectOutputs(
+	container WellResults=cnt() inout "processed Well result container",
+	table FieldTable inout,
+	string IN_FolderResultOutput in,
+)
+[experimental] Evotec Library "Collect information from WellResults and FieldResults and report via output or file"
+{
+	GetSys(EVT_Workflow)
+	set(WF_SaveResultImages=at("Images",EVT_Workflow))
+	set(WF_SaveResults=at("SaveResults",EVT_Workflow))
+	
+	dbg::Log(5,"EVT","FieldProcessing","Collect Outputs")
+
+	//Collect inputParameters
+	pack(InPara,"IN_*")
+	EVT_Helper_CollectInputs(InPara=InPara, WellResults=WellResults | WellResults )
+	delete(InPara)
+	
+	sep=",";
+
+	//Save FieldResults
+	if(WF_SaveResults)
+		foreach(range(0,FieldTable.@rowcount),"_field")
+			set(outputtable=tbl())
+			if(FieldTable.Valid[_field])
+				set(FieldResults=eval("FieldTable.FieldResults[_field]",cnt()))
+				foreach(FieldResults.@keys,"k")
+					entry=tbl(Name=k,Value=eval("FieldResults." & k,vec()));
+					outputtable.@appendrow=entry;
+				end()
+				if(outputtable.@rowcount>0)
+					SortTable(table=outputtable,columns="name" | outputtable=table)
+					set(resultline=tbl(Field=FieldTable.fieldname[_field]))
+					foreach(range(0,outputtable.@rowcount),"o")
+						set(_["resultline." & outputtable.name[o]]=outputtable.value[o])
+					end()
+				End()
+				if(length(IN_FolderResultOutput)>0)
+					#filename="FieldResults.csv";
+					filename="FieldResults_"& WellResults._RAW_WellName&".csv"; //edit BS  20160323
+					#EVT_ThreadLock(|_EVT_ThreadLockID=_EVT_ThreadLockID) //edit BS  20160323
+					dbg::Log(5,"MV","WriteField",WellResults._RAW_WellName)
+					try()
+						if(FileInfo(IN_FolderResultOutput).FileInfo.exists)
+							set(Folder1="/" & Columbus::ValidFilenamePart(WellResults._RAW_PlateName).filename)
+							set(Folder2="/" & Columbus::ValidFilenamePart(WellResults._RAW_MeasurementDate).filename)
+							if(!FileInfo(IN_FolderResultOutput & Folder1).FileInfo.exists)
+								MKDir(IN_FolderResultOutput & Folder1)
+							end()
+							if(!FileInfo(IN_FolderResultOutput & Folder1 & Folder2).FileInfo.exists)
+								MKDir(IN_FolderResultOutput & Folder1 & Folder2)
+							end()
+						end()
+						set(filename=IN_FolderResultOutput & Folder1 & Folder2 & "/" & filename)
+						if(FileInfo(filename).FileInfo.exists)
+							readtable(resulttable,filename,separators=sep,columns="firstrow",ignorecomments=false)
+						else()
+							set(resulttable=tbl())
+						end()
+						set(pos=eval("FindElem(Fieldtable.fieldname[_field],resulttable.field).pos",-1))
+						if(pos>-1)
+							TableFilter("rowindex!=" & pos,table=resulttable | resulttable=table)
+						end()
+						EVT_Helper_AppendTableRows(resulttable,other=resultline | resulttable=table)
+						SortTable(table=resulttable,columns="PlateName_RAW,MeasurementDate_RAW,WellName_RAW" | resulttable=table)
+						set(WellResults._HIDDEN_WellResultTable_Multi=resulttable)
+						EVT_Helper_TableToCSV(resulttable,".",sep,"\n")
+						write(Filename=filename,item=csvstring,append=false)
+					end()
+					#EVT_ThreadUnLock(_EVT_ThreadLockID=_EVT_ThreadLockID) //edit BS  20160323
+				end()
+			end()
+		end()
+	End()
+	
+	
+	foreach(WellResults.@keys,"k")
+		if(at("_REGISTER_",k)==1)
+			set(label=rep(k,"_REGISTER_",""))
+			set(wres=eval("WellResults." & label,_["WellResults." & k]))
+			set(_["WellResults." & label]=wres)
+		end()
+	end()
+
+	set(outputtable=tbl())
+	foreach(WellResults.@keys,"k")
+		set(wres=eval("WellResults." & k,vec()))
+		set(label=k)
+		set(entry=tbl(Name=k,Value=NAN,Operation="Unknown"))
+		set(operations=vec("MEAN","MEDIAN","SUM","STDDEV","MIN","MAX"))
+		set(found=false)
+		foreach(operations,"op")
+			if(at("_" & op & "_",label)==1)
+				set(entry.Name="OUT_"& rep(label,"_" & op & "_","") & "_" & op)
+				set(entry.Value=_["wres." & op])
+				set(entry.Operation=op)
+				set(found=true)
+			end()
+		end()
+
+		if(not found)
+			if(at("_REGISTER_",label)==1)
+				set(entry=tbl())
+			elif(at("_HIDDEN_",label)==1)
+				set(entry=tbl())
+			elif(at("_COUNT_",label)==1)
+				set(entry.Name=rep(label,"_COUNT_","") & "_COUNT")
+				set(entry.Value=wres.length)
+				set(entry.Operation="COUNT")
+			elif(at("_LIST_",label)==1)
+				sprintfloop(s,"%s ",wres)
+				set(s=trim(s))
+				set(entry.Name=rep(label,"_LIST_","") & "_LIST")
+				set(entry.Value=s)
+				set(entry.Operation="LIST")
+			elif(at("_HISTO_",label)==1)
+				sprintfloop(s,"%s ",wres)
+				set(s=trim(s))
+				set(entry.Name=rep(label,"_HISTO_","") & "_HISTO")
+				set(entry.Value=s)
+				set(entry.Operation="HISTO")
+			elif(at("_RAW_",label)==1)
+				if(at("IN_",label)!=6)
+					set(entry.Name="EXP_" & rep(label,"_RAW_",""))
+					set(entry.Value=wres)
+					set(entry.Operation="RAW")
+				else()
+					set(entry.Name=rep(label,"_RAW_",""))
+					set(entry.Value=wres)
+					set(entry.Operation="RAW")
+				End()
+			elif(at("_OUTPUTFILE_",label)==1)
+				set(entry=tbl())
+				if(length(IN_FolderResultOutput)>0)
+					set(filename="")
+					try()
+						if(FileInfo(IN_FolderResultOutput).FileInfo.exists)
+							set(Folder1="/" & Columbus::ValidFilenamePart(WellResults._RAW_PlateName).filename)
+							set(Folder2="/" & Columbus::ValidFilenamePart(WellResults._RAW_MeasurementDate).filename)
+							if(!FileInfo(IN_FolderResultOutput & Folder1).FileInfo.exists)
+								MKDir(IN_FolderResultOutput & Folder1)
+							end()
+							if(!FileInfo(IN_FolderResultOutput & Folder1 & Folder2).FileInfo.exists)
+								MKDir(IN_FolderResultOutput & Folder1 & Folder2)
+							end()
+							if(wres.Type=="table" and WF_SaveResults)
+								set(FileName=IN_FolderResultOutput & Folder1 & Folder2 & "/" & Columbus::ValidFilenamePart(wres.Name).filename)
+								set(filename=iif(at(".txt",filename),filename,filename & ".txt"))
+								EVT_Helper_TableToCSV(wres.Value,".",sep,"\n")
+								writefile(fileName,content=csvstring)
+							end()
+							if(wres.Type=="visualimage" and WF_SaveResults)
+								set(Folder3="/resultImages")
+								if(!FileInfo(IN_FolderResultOutput & Folder3).FileInfo.exists)
+									MKDir(IN_FolderResultOutput & Folder1 & Folder2 & Folder3)
+								end()
+								set(FileName=IN_FolderResultOutput & Folder1 & Folder2 & Folder3 & "/" & Columbus::ValidFilenamePart(wres.Name).filename)
+								set(filename=iif(at(".png",filename),filename,filename & ".png"))
+								writeimage(fileName,imageformat="png",image=wres.Value)
+							end()
+						end()
+					Catch_Error()
+						dbg::Log(5,"EVT","FieldProcessing","Collect Outputs - Error in writing " & filename)
+					end()
+				end()
+			else()
+				set(entry.Name=label)
+				set(entry.Value=wres.mean)
+				set(entry.Operation="MEAN")			end()
+		end()
+		set(outputtable.@appendrow=entry)
+	end()
+
+	if(outputtable.@rowcount>0)
+		SortTable(table=outputtable,columns="name" | outputtable=table)
+		set(resultline=tbl())
+		foreach(range(0,outputtable.@rowcount),"o")
+			output(outputtable.value[o],outputtable.name[o])
+			set(_["resultline." & outputtable.name[o]]=outputtable.value[o])
+		end()
+		set(WellResults._HIDDEN_WellResultTable_Single=resultline)
+		if(WF_SaveResults)
+			if(length(IN_FolderResultOutput)>0)
+				filename="WellResults.csv";
+				EVT_ThreadLock(|_EVT_ThreadLockID=_EVT_ThreadLockID)
+				dbg::Log(5,"MV","WriteWell",WellResults._RAW_WellName)
+				try()
+					if(FileInfo(IN_FolderResultOutput).FileInfo.exists)
+						set(Folder1="/" & Columbus::ValidFilenamePart(WellResults._RAW_PlateName).filename)
+						set(Folder2="/" & Columbus::ValidFilenamePart(WellResults._RAW_MeasurementDate).filename)
+						if(!FileInfo(IN_FolderResultOutput & Folder1).FileInfo.exists)
+							MKDir(IN_FolderResultOutput & Folder1)
+						end()
+						if(!FileInfo(IN_FolderResultOutput & Folder1 & Folder2).FileInfo.exists)
+							MKDir(IN_FolderResultOutput & Folder1 & Folder2)
+						end()
+					end()
+					set(filename=IN_FolderResultOutput & Folder1 & Folder2 & "/" & filename)
+					if(FileInfo(filename).FileInfo.exists)
+						readtable(resulttable,filename,separators=sep,columns="firstrow",ignorecomments=false)
+					else()
+						set(resulttable=tbl())
+					end()
+					set(pos=eval("FindElem(WellResults._RAW_WellUID,resulttable.WellUID_RAW).pos",-1))
+					if(pos>-1)
+						TableFilter("rowindex!=" & pos,table=resulttable | resulttable=table)
+					end()
+					EVT_Helper_AppendTableRows(resulttable,other=resultline | resulttable=table)
+					SortTable(table=resulttable,columns="PlateName_RAW,MeasurementDate_RAW,WellName_RAW" | resulttable=table)
+					set(WellResults._HIDDEN_WellResultTable_Multi=resulttable)
+					EVT_Helper_TableToCSV(resulttable,".",sep,"\n")
+					write(Filename=filename,item=csvstring,append=false)
+				end()
+				EVT_ThreadUnLock(_EVT_ThreadLockID=_EVT_ThreadLockID)
+			end()
+		end()
+	end()
+}
+
+proc EVT_ThreadLock(
+integer maxsleep=20 in,
+string _EVT_ThreadLockID="" out
+)
+[experimental] Evotec Library "Wait until thread is first in row"
+{
+	set(_EVT_ThreadLockID="#" & CreateUUID().UUID)
+
+	set(currentsleep=0)
+	while(currentsleep<maxsleep)
+		GetSys(EVT_ThreadLockID)
+		SplitString(EVT_ThreadLockID,Separators="#",KeepEmpty=false,Trim=true)
+		set(Split="#" & uniq(Split).result)
+		set(positions=at(_EVT_ThreadLockID,split))
+		if(positions.max>0)
+			if(positions.maxat==0)
+				set(currentsleep=maxsleep)
+			else()
+				sleep(1.0-rnd())
+			end()
+		else()
+			GetSys(EVT_ThreadLockID)
+			set(EVT_ThreadLockID=EVT_ThreadLockID & _EVT_ThreadLockID)
+			SetSys(EVT_ThreadLockID=EVT_ThreadLockID)
+		end()
+		set(currentsleep=currentsleep+1)
+	end()
+}
+
+proc EVT_ThreadUnlock(
+string _EVT_ThreadLockID in
+)
+[experimental] Evotec Library "Release thread from queue"
+{
+	GetSys(EVT_ThreadLockID)
+	while(at(_EVT_ThreadLockID,EVT_ThreadLockID))
+		set(EVT_ThreadLockID=rep(EVT_ThreadLockID,_EVT_ThreadLockID,""))
+		SetSys(EVT_ThreadLockID=EVT_ThreadLockID)
+		GetSys(EVT_ThreadLockID)
+	end()
+}
+
+proc EVT_Helper_AppendTableRows(
+table table inout,
+table other in
+)
+[experimental] Evotec Library "Append table rows without reduction"
+{
+	set(col=vec())
+	append(col,eval("table.@columns",vec()))
+	append(col,eval("other.@columns",vec()))
+	set(col=uniq(col).result)
+
+	if(table.@rowcount==0 or other.@rowcount==0)
+		set(table.@appendrow=other)
+	else()
+		rename(table_orig=table)
+		set(table=tbl())
+		set(empty=filledvec(table_orig.@rowcount,""))
+		append(empty,filledvec(other.@rowcount,""))
+
+		foreach(col,"c")
+			set(a=eval("table_orig." & c,vec()))
+			if(a.length!=table_orig.@rowcount)
+				set(a=filledvec(table_orig.@rowcount,""))
+			end()
+
+			set(b=eval("other." & c,vec()))
+			if(b.length!=other.@rowcount)
+				set(b=filledvec(other.@rowcount,""))
+			end()
+
+			delete(m)
+			if(a[0].elemtype==b[0].elemtype)
+				set(m=a)
+				append(m,b)
+			else()
+				set(m="" & a)
+				append(m,"" & b)
+			end()
+			set(_["table." & c]=m)
+		end()
+	end()
+}
+
+proc EVT_Helper_TableToCSV(
+	table table in "the processed table",
+	string decimalseparator="." in "decimal separator",
+	string columnseparator="\t" in "column separator",
+	string lineseparator="\n" in "line separator",
+	boolean includeheader=true in,
+	boolean useStrictTypes=false in "Try converting string columns to numeric type",
+	string csvstring out
+) 
+[experimental] Evotec Library "Converts a table into of CSV-like string with defined decimal, column and line separator"
+{
+	set(csvstring="",header="",lines="",first=true)
+	if(table.@rowcount>0)
+		if(!useStrictTypes)
+			TableStringColumns2Numeric(table)
+		end()
+		foreach(range(0,table.@columncount),"c")
+			if(includeheader)
+				set(headername=table.@columns[c])
+				set(headername=unquote(headername,"name").text)
+				set(headername=rep(trim(headername),columnseparator,""))
+				set(header=header & iif(first,"",columnseparator) & headername)
+			end()
+			set(vin=_.table[table.@columns[c]])
+			set(vin=eval("1*vin",vin))
+			if((vin.elemtype==0) or (vin.elemtype==7) or (vin.elemtype==15))
+				set(vout="" & vin)
+				set(vout=rep(vout,".",decimalseparator))
+			else()
+				if(vin.elemtype==9)
+					set(vin=filledvec(vin.length,""))
+				end()
+				set(vout="" & vin)
+			end()
+			set(vout=rep(vout,columnseparator,""))
+			if(first)
+				set(lines=vout)
+			else()
+				set(lines=lines & columnseparator & vout)
+			end()
+			set(first=false)
+		end()
+		SprintfLoop(csvstring,"%s%s",lines,lineseparator)
+		if(includeheader)
+			set(csvstring=header & lineseparator & csvstring)
+		end()
+	end()
+}
+
+proc EVT_StartEvaluation(
+integer maxevaluations=0 in,
+integer maxsleep=5000 in,
+string _EVT_evaluationID="" out
+)
+[experimental] Evotec Library "Start limited number of evaluations simultaneously. Wait until this _EVT_evaluationID is in front of the queue. This is usefull if one evaluation needs a lot of memory to avoid swaping."
+{
+	set(_EVT_evaluationID="#" & CreateUUID().UUID)
+	
+	// use maxevaluation limitation only if needed (avoid overhead by thread blocking)
+	GetEnv("ACAPELLA_NUM_THREADS")
+	set(ACAPELLA_NUM_THREADS=eval("int(ACAPELLA_NUM_THREADS)",0))
+	if(maxevaluations)
+		if(maxevaluations>=ACAPELLA_NUM_THREADS)
+			set(maxevaluations=0)
+		end()
+	end()
+
+	// skip on Opera 2.0/Acapella version 2.6 no need for threadmanagement on RMCA
+	if(__version__>26 and maxevaluations)
+		set(currentsleep=iif(maxevaluations>0,0,maxsleep))
+		while(currentsleep<maxsleep)
+			GetSys(EVT_EvaluationID)
+			SplitString(EVT_EvaluationID,Separators="#",KeepEmpty=false,Trim=true)
+			set(Split="#" & uniq(Split).result)
+			set(positions=at(_EVT_evaluationID,split))
+			if(positions.max>0)
+				if(positions.maxat<=maxevaluations)
+					set(currentsleep=maxsleep)
+				else()
+					sleep(1.0-rnd())
+				end()
+			else()
+				GetSys(EVT_EvaluationID)
+				set(EVT_EvaluationID=EVT_EvaluationID & _EVT_evaluationID)
+				SetSys(EVT_EvaluationID=EVT_EvaluationID)
+			end()
+			set(currentsleep=currentsleep+1)
+		end()
+
+	end()
+}
+
+proc EVT_EndEvaluation(
+string _EVT_evaluationID in
+)
+[experimental] Evotec Library "End evaluation and clean up flag inside queue."
+{
+	// skip on Opera2.0/Acapella version 2.6 no need for threadmanagement on RMCA
+	if(__version__>26)
+		GetSys(EVT_EvaluationID)
+		while(at(_EVT_evaluationID,EVT_EvaluationID))
+			set(EVT_EvaluationID=rep(EVT_EvaluationID,_EVT_evaluationID,""))
+			SetSys(EVT_EvaluationID=EVT_EvaluationID)
+			GetSys(EVT_EvaluationID)
+		end()
+
+	end()
+}
+
+proc EVT_Helper_CalculateTextureImage(
+	double scale=0 in,
+	string type="spot" in,
+	vector images inout
+)
+[experimental] Evotec Library "Calculate a texture images"
+{
+	GetSys(EVT_Workflow)
+	set(LimitMemory=at("LimitMemory",EVT_Workflow))
+	dbg::Log(6,"EVT","Helper","Calculate TextureImage")
+
+	SplitString(type,Separators=",",KeepEmpty=false,Trim=true)
+
+	pop(images,itemname="image",pos=0)
+	mask(1,image=blank(image.width,image.height,1).image)
+	Mask2Stencil()
+	Stencil2Objects()
+	Texture::CalcSERFeatures(image=image,scale=scale)
+
+	set(found=vec())
+	foreach(range(0,SERNames.length),"n")
+		foreach(Split,"s")
+			if(at(s,SERNames[n]))
+				push(found,n)
+			end()
+		end()
+	end()
+	foreach(range(0,found.length),"f")
+		push(images_out,SERIllustrations[found[f]])
+	end()
+	if(images.length>0)
+		if(LimitMemory)
+			foreach(range(0,images.length),"p")
+				pop(images,itemname="image",pos=0)
+				Texture::CalcSERFeatures(image=image,scale=scale)
+				foreach(range(0,found.length),"f")
+					push(images_out,SERIllustrations[found[f]])
+				end()
+			end()
+		else()
+			Texture::CalcSERFeatures(image=parallel(images),scale=scale)
+			foreach(range(0,SERIllustrations.length),"i")
+				foreach(range(0,found.length),"f")
+					push(images_out,SERIllustrations[i][found[f]])
+				end()
+			end()
+		end()
+	end()
+	rename(images=images_out)
+}
