@@ -1,0 +1,31 @@
+{
+    "creators": [
+        {
+            "orcid": "0000-0003-0357-7422",
+            "affiliation": "Laboratory of Cell Biology and Histology, University of Antwerp, Belgium" ,
+            "affiliation": "Antwerp Centre for Advanced Microscopy, Belgium",
+            "affiliation": "µNEURO Research Centre of Excellence, University of Antwerp, Antwerp, Belgium",
+            "name": "Verschuuren, Marlies"
+        },
+        {
+            "orcid": "0000-0002-2214-2806",
+            "affiliation": "Laboratory of Cell Biology and Histology, University of Antwerp, Belgium" ,
+            "affiliation": "µNEURO Research Centre of Excellence, University of Antwerp, Antwerp, Belgium",
+            "name": "Verstraelen, Peter"
+        },
+        {
+            "orcid": "0000-0003-0960-6781",
+            "affiliation": "Laboratory of Cell Biology and Histology, University of Antwerp, Belgium" ,
+            "affiliation": "Antwerp Centre for Advanced Microscopy, Belgium",
+            "affiliation": "µNEURO Research Centre of Excellence, University of Antwerp, Antwerp, Belgium",
+            "name": "De Vos, Winnok H."
+        }
+    ],
+    "related_identifiers": [
+        {
+            "identifier": "https://doi.org/10.1186/s40478-019-0741-3",
+            "relation": "isSupplementTo",
+            "resource_type": "publication-article"
+        }
+    ]
+}
